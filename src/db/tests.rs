@@ -5,7 +5,7 @@
 //! directory per test and clean up via `tempfile`.
 
 use super::models::*;
-use super::{Db, backup, schema};
+use super::{Db, backup, queries, schema};
 use rusqlite::params;
 use time::{Duration, OffsetDateTime};
 
@@ -34,6 +34,9 @@ fn sample_website(name: &str) -> Website {
         next_visit_at: None,
         created_at: ts,
         updated_at: ts,
+        active_window_start: None,
+        active_window_end: None,
+        timezone: None,
     }
 }
 
@@ -109,6 +112,95 @@ async fn migrate_is_idempotent() {
         .call(schema::migrate)
         .await
         .expect("re-migrate");
+    let version: i64 = db
+        .connection()
+        .call(|c| schema::user_version(c))
+        .await
+        .expect("user_version");
+    assert_eq!(version, schema::SCHEMA_VERSION);
+}
+
+#[tokio::test]
+async fn fresh_db_has_v2_website_window_columns() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let cols: Vec<String> = db
+        .connection()
+        .call(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(websites)")?;
+            let cols = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, rusqlite::Error>(cols)
+        })
+        .await
+        .expect("table_info");
+    for col in ["active_window_start", "active_window_end", "timezone"] {
+        assert!(cols.iter().any(|c| c == col), "missing column {col}");
+    }
+}
+
+#[tokio::test]
+async fn v1_database_is_upgraded_to_v2_preserving_data() {
+    // Simulate a pre-SEG-08 (schema v1) install: create a database with the
+    // v1 DDL and user_version = 1 by hand, insert a website row, close it,
+    // then let `Db::open` migrate it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v1.db");
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw open");
+        conn.execute_batch(
+            "CREATE TABLE websites (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                    TEXT NOT NULL,
+                url                     TEXT NOT NULL,
+                enabled                 INTEGER NOT NULL DEFAULT 1,
+                profile_id              INTEGER NULL,
+                monitoring_mode         TEXT NOT NULL DEFAULT 'basic'
+                                        CHECK (monitoring_mode IN ('basic', 'interaction')),
+                min_interval_seconds    INTEGER NOT NULL DEFAULT 480,
+                max_interval_seconds    INTEGER NOT NULL DEFAULT 780,
+                min_session_seconds     INTEGER NOT NULL DEFAULT 15,
+                max_session_seconds     INTEGER NOT NULL DEFAULT 60,
+                last_visit_at           TEXT NULL,
+                next_visit_at           TEXT NULL,
+                created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK (min_interval_seconds <= max_interval_seconds),
+                CHECK (min_session_seconds <= max_session_seconds)
+            ) STRICT;
+            CREATE TABLE scheduler_state (
+                website_id          INTEGER PRIMARY KEY REFERENCES websites(id) ON DELETE CASCADE,
+                next_visit_at       TEXT NULL,
+                last_execution_at   TEXT NULL,
+                retry_count         INTEGER NOT NULL DEFAULT 0,
+                job_status          TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK (job_status IN ('pending', 'running', 'paused', 'retry', 'disabled')),
+                lease_expires_at    TEXT NULL
+            ) STRICT;
+            INSERT INTO websites (name, url, enabled) VALUES ('legacy', 'https://legacy.example.com/', 1);
+            PRAGMA user_version = 1;",
+        )
+        .expect("v1 fixture");
+    }
+    let db = Db::open(&path).await.expect("open migrates v1 -> v2");
+    let version: i64 = db
+        .connection()
+        .call(|c| schema::user_version(c))
+        .await
+        .expect("user_version");
+    assert_eq!(version, schema::SCHEMA_VERSION);
+    let website = db
+        .get_website(1)
+        .await
+        .expect("read legacy site")
+        .expect("legacy site exists");
+    assert_eq!(website.name, "legacy");
+    assert_eq!(website.active_window_start, None);
+    assert_eq!(website.active_window_end, None);
+    assert_eq!(website.timezone, None);
+    // A re-open (all migrations applied) must stay clean.
+    drop(db);
+    let db = Db::open(&path).await.expect("second open");
     let version: i64 = db
         .connection()
         .call(|c| schema::user_version(c))
@@ -642,4 +734,158 @@ async fn cleanup_expired_history_with_zero_retention_deletes_everything() {
         .expect("visit");
     let stats = db.cleanup_expired_history(0).await.expect("cleanup");
     assert!(stats.visit_history_deleted >= 1);
+}
+
+#[tokio::test]
+async fn claim_website_job_scheduled_cas_is_single_winner() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let website_id = db
+        .insert_website(&sample_website("cas"))
+        .await
+        .expect("insert");
+    let mut state = scheduler_state(website_id);
+    state.next_visit_at = Some(now() - Duration::seconds(5));
+    db.upsert_scheduler_state(&state).await.expect("seed state");
+
+    // Future-due gating: a not-yet-due row is not claimable.
+    let mut future = scheduler_state(website_id);
+    future.next_visit_at = Some(now() + Duration::hours(1));
+    db.upsert_scheduler_state(&future)
+        .await
+        .expect("future state");
+    let blocked = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Scheduled)
+        .await
+        .expect("claim");
+    assert!(blocked.is_none(), "not-yet-due row must not be claimable");
+
+    // Due again: exactly one claimant wins; the loser gets None.
+    let mut due = scheduler_state(website_id);
+    due.next_visit_at = Some(now() - Duration::seconds(1));
+    db.upsert_scheduler_state(&due).await.expect("due state");
+    let first = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Scheduled)
+        .await
+        .expect("claim 1");
+    assert!(first.is_some());
+    let (old_status, claimed) = first.expect("claim 1 wins");
+    assert_eq!(old_status, JobStatus::Pending);
+    assert_eq!(claimed.job_status, JobStatus::Running);
+    assert!(claimed.lease_expires_at.expect("lease") > now());
+
+    let second = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Scheduled)
+        .await
+        .expect("claim 2");
+    assert!(second.is_none(), "second claimant must lose the CAS");
+
+    let manual = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Manual)
+        .await
+        .expect("manual claim while running");
+    assert!(
+        manual.is_none(),
+        "manual claim must not double-run a running job"
+    );
+}
+
+#[tokio::test]
+async fn claim_website_job_manual_bypasses_interval_and_claims_paused() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let website_id = db
+        .insert_website(&sample_website("manual"))
+        .await
+        .expect("insert");
+
+    // Manual is allowed on a future-scheduled row...
+    let mut state = scheduler_state(website_id);
+    state.next_visit_at = Some(now() + Duration::hours(2));
+    db.upsert_scheduler_state(&state).await.expect("seed");
+    let claimed = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Manual)
+        .await
+        .expect("manual claim");
+    assert!(claimed.is_some(), "manual claim bypasses next_visit_at");
+
+    // ... and on a paused row (the previous status is returned for the
+    // pause-preserving completion logic). Reset to paused first.
+    db.set_scheduler_state_status(website_id, JobStatus::Paused, None, 0)
+        .await
+        .expect("pause");
+    let claimed = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Manual)
+        .await
+        .expect("manual claim paused");
+    let (old_status, _) = claimed.expect("paused claimable by manual");
+    assert_eq!(old_status, JobStatus::Paused);
+
+    // Scheduled claims must not steal a paused row.
+    db.set_scheduler_state_status(website_id, JobStatus::Paused, None, 0)
+        .await
+        .expect("pause again");
+    let blocked = db
+        .claim_website_job(website_id, now(), 60, queries::ClaimKind::Scheduled)
+        .await
+        .expect("scheduled claim paused");
+    assert!(
+        blocked.is_none(),
+        "paused row is never claimed by the background loop"
+    );
+}
+
+#[tokio::test]
+async fn list_claimable_jobs_returns_enabled_pending_and_retry_only() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let enabled = db.insert_website(&sample_website("ena")).await.expect("e");
+    let disabled = db
+        .insert_website(&Website {
+            enabled: false,
+            ..sample_website("dis")
+        })
+        .await
+        .expect("d");
+    let paused = db.insert_website(&sample_website("pau")).await.expect("p");
+
+    for id in [enabled, disabled, paused] {
+        insert_default_state(&db, id).await;
+    }
+    db.set_scheduler_state_status(paused, JobStatus::Paused, None, 0)
+        .await
+        .expect("pause");
+
+    let jobs = db.list_claimable_scheduler_jobs().await.expect("list");
+    let ids: Vec<i64> = jobs.iter().map(|(s, _)| s.website_id).collect();
+    assert_eq!(ids, vec![enabled], "retry rows also included once due");
+
+    // Retry row is included as well; disabled and paused are not.
+    db.set_scheduler_state_status(enabled, JobStatus::Retry, Some(now()), 1)
+        .await
+        .expect("retry");
+    let jobs = db.list_claimable_scheduler_jobs().await.expect("list");
+    let ids: Vec<i64> = jobs.iter().map(|(s, _)| s.website_id).collect();
+    assert_eq!(ids, vec![enabled]);
+
+    // A fresh enabled website with NO scheduler_state row is reported as
+    // missing; all three seeded sites (which have rows) are not.
+    let missing = db
+        .list_enabled_website_ids_missing_scheduler_state()
+        .await
+        .expect("missing list");
+    assert!(missing.is_empty());
+    let fresh = db
+        .insert_website(&sample_website("fresh"))
+        .await
+        .expect("f");
+    let missing = db
+        .list_enabled_website_ids_missing_scheduler_state()
+        .await
+        .expect("missing");
+    assert!(missing.contains(&fresh));
+}
+
+// helper: mirror scheduler_state() defaults for the list test
+async fn insert_default_state(db: &Db, website_id: i64) {
+    db.upsert_scheduler_state(&scheduler_state(website_id))
+        .await
+        .expect("state");
 }

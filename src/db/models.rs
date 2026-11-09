@@ -126,6 +126,18 @@ pub struct Website {
     pub last_visit_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub next_visit_at: Option<OffsetDateTime>,
+    /// `"HH:MM"` local wall-clock start of the daily active monitoring
+    /// window, interpreted in `timezone`. `NULL` (or a missing end)
+    /// means the website is always active. Added in schema v2.
+    pub active_window_start: Option<String>,
+    /// `"HH:MM"` local wall-clock end of the daily active monitoring window
+    /// (may wrap past midnight, e.g. `22:00`–`06:00`). `NULL` means always
+    /// active. Added in schema v2.
+    pub active_window_end: Option<String>,
+    /// IANA timezone name (e.g. `Europe/Berlin`) for the window; `NULL`
+    /// falls back to the deployment `TZ` (itself defaulting to `UTC`).
+    /// Added in schema v2.
+    pub timezone: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]

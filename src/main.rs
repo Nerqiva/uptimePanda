@@ -85,6 +85,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         None
     };
+    // SEG-08: scheduler module is implemented (jitter, priority queue,
+    // active windows, recovery, pause/resume) but is NOT started here on
+    // purpose — the dispatch channel it emits on is consumed by the
+    // executor. SEG-10 spawns it:
+    //   let (tx, rx) = tokio::sync::mpsc::channel(1);
+    //   let handle = scheduler::Scheduler::from_env_tz(db.clone()).start(tx);
+    // (handle_completion + enqueue_manual/set_paused live on SchedulerHandle)
     let _browser_manager = manager;
 
     let app = Router::new()

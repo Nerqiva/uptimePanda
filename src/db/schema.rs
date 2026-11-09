@@ -16,7 +16,7 @@ use rusqlite::Connection;
 
 /// Current schema version. Bump this (never reuse a version number) whenever
 /// a future migration is added.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// All DDL for schema version 1. Every statement is idempotent.
 const SCHEMA_V1_DDL: &str = "
@@ -119,6 +119,38 @@ CREATE INDEX IF NOT EXISTS idx_websites_next_visit_at ON websites(next_visit_at)
 CREATE INDEX IF NOT EXISTS idx_cookies_profile_id ON cookies(profile_id);
 ";
 
+/// Schema v1 -> v2. Adds the per-website active-monitoring window override:
+/// `active_window_start` / `active_window_end` (`"HH:MM"` local wall clock)
+/// and `timezone` (IANA name). All three are nullable — `NULL` means
+/// "always active" (no window restriction).
+///
+/// `ALTER TABLE … ADD COLUMN` cannot run twice for the same column, so each
+/// statement is guarded by a `PRAGMA table_info(websites)` check first.
+fn migrate_v1_to_v2(conn: &mut Connection) -> crate::db::Result<()> {
+    let existing: Vec<String> = conn
+        .prepare("PRAGMA table_info(websites)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let add_column = |conn: &Connection, name: &str| -> crate::db::Result<()> {
+        if existing.iter().any(|c| c == name) {
+            return Ok(());
+        }
+        conn.execute(
+            &format!("ALTER TABLE websites ADD COLUMN {name} TEXT NULL"),
+            [],
+        )?;
+        Ok(())
+    };
+    // Run in a transaction so a crash mid-migration leaves no half-applied
+    // column set behind (SQLite DDL is transactional).
+    let tx = conn.transaction()?;
+    add_column(&tx, "active_window_start")?;
+    add_column(&tx, "active_window_end")?;
+    add_column(&tx, "timezone")?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Apply pending migrations to `conn`. Safe to call on every open; already
 /// migrated databases are left untouched.
 ///
@@ -129,7 +161,11 @@ pub fn migrate(conn: &mut Connection) -> crate::db::Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(SCHEMA_V1_DDL)?;
         tx.commit()?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        conn.pragma_update(None, "user_version", 1)?;
+    }
+    if version < 2 {
+        migrate_v1_to_v2(conn)?;
+        conn.pragma_update(None, "user_version", 2)?;
     }
     Ok(())
 }

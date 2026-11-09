@@ -42,6 +42,9 @@ fn website_from_row(row: &Row<'_>) -> rusqlite::Result<Website> {
         next_visit_at: parse_db_ts_opt(row.get("next_visit_at")?, 11)?,
         created_at: parse_db_ts(&row.get::<_, String>("created_at")?, 12)?,
         updated_at: parse_db_ts(&row.get::<_, String>("updated_at")?, 13)?,
+        active_window_start: row.get("active_window_start")?,
+        active_window_end: row.get("active_window_end")?,
+        timezone: row.get("timezone")?,
     })
 }
 
@@ -99,7 +102,8 @@ fn visit_history_from_row(row: &Row<'_>) -> rusqlite::Result<VisitHistoryRow> {
 
 const WEBSITE_COLUMNS: &str = "id, name, url, enabled, profile_id, monitoring_mode, \
      min_interval_seconds, max_interval_seconds, min_session_seconds, max_session_seconds, \
-     last_visit_at, next_visit_at, created_at, updated_at";
+     last_visit_at, next_visit_at, created_at, updated_at, \
+     active_window_start, active_window_end, timezone";
 
 const PROFILE_COLUMNS: &str = "id, name, description, user_agent, enabled, \
     configuration_json, created_at, updated_at";
@@ -160,8 +164,9 @@ impl Db {
                         (name, url, enabled, profile_id, monitoring_mode,
                          min_interval_seconds, max_interval_seconds,
                          min_session_seconds, max_session_seconds,
-                         last_visit_at, next_visit_at, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         last_visit_at, next_visit_at, created_at, updated_at,
+                         active_window_start, active_window_end, timezone)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         website.name,
                         website.url,
@@ -176,6 +181,9 @@ impl Db {
                         next_visit_at,
                         created_at,
                         updated_at,
+                        website.active_window_start,
+                        website.active_window_end,
+                        website.timezone,
                     ],
                 )?;
                 Ok(c.last_insert_rowid())
@@ -200,7 +208,9 @@ impl Db {
                         monitoring_mode = ?6, min_interval_seconds = ?7,
                         max_interval_seconds = ?8, min_session_seconds = ?9,
                         max_session_seconds = ?10, last_visit_at = ?11,
-                        next_visit_at = ?12, updated_at = ?13
+                        next_visit_at = ?12, updated_at = ?13,
+                        active_window_start = ?14, active_window_end = ?15,
+                        timezone = ?16
                      WHERE id = ?1",
                     params![
                         website.id,
@@ -216,6 +226,9 @@ impl Db {
                         last_visit_at,
                         next_visit_at,
                         updated_at,
+                        website.active_window_start,
+                        website.active_window_end,
+                        website.timezone,
                     ],
                 )
             })
@@ -374,6 +387,10 @@ impl Db {
     /// passed by at least `lease_slack_seconds` (or is NULL) goes back to
     /// `pending` and its lease is cleared. Returns the number of rows
     /// recovered.
+    /// Requeue stale jobs: any `running` row whose `lease_expires_at` has
+    /// passed by at least `lease_slack_seconds` (or is NULL) goes back to
+    /// `pending` and its lease is cleared. Returns the number of rows
+    /// recovered.
     pub async fn recover_stale_running(&self, lease_slack_seconds: i64) -> Result<u64> {
         let cutoff =
             format_db_ts(OffsetDateTime::now_utc() - Duration::seconds(lease_slack_seconds))?;
@@ -391,6 +408,203 @@ impl Db {
             .await?;
         Ok(recovered as u64)
     }
+
+    /// Read the scheduler row for a website, if any.
+    pub async fn get_scheduler_state(&self, website_id: i64) -> Result<Option<SchedulerState>> {
+        let row = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Option<SchedulerState>> {
+                c.query_row(
+                    "SELECT website_id, next_visit_at, last_execution_at,
+                            retry_count, job_status, lease_expires_at
+                     FROM scheduler_state WHERE website_id = ?1",
+                    params![website_id],
+                    scheduler_state_from_row,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// All `(scheduler_state, website)` pairs whose state is claimable
+    /// (`pending`/`retry`) and whose website is `enabled = 1`. Used by the
+    /// scheduler to (re)build its in-memory heap after boot and completions.
+    pub async fn list_claimable_scheduler_jobs(&self) -> Result<Vec<(SchedulerState, Website)>> {
+        let pairs = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<(SchedulerState, Website)>> {
+                let states = {
+                    let mut stmt = c.prepare(
+                        "SELECT website_id, next_visit_at, last_execution_at,
+                                retry_count, job_status, lease_expires_at
+                         FROM scheduler_state
+                         WHERE job_status IN ('pending', 'retry')
+                         ORDER BY next_visit_at",
+                    )?;
+                    stmt.query_map([], scheduler_state_from_row)?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let mut out = Vec::with_capacity(states.len());
+                let stmt_sql = format!("SELECT {WEBSITE_COLUMNS} FROM websites WHERE id = ?1");
+                for state in states {
+                    let website =
+                        c.query_row(&stmt_sql, params![state.website_id], website_from_row)?;
+                    if website.enabled {
+                        out.push((state, website));
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+        Ok(pairs)
+    }
+
+    /// Ids of `enabled` websites that have no `scheduler_state` row yet.
+    /// Used to reconcile fresh databases on scheduler boot.
+    pub async fn list_enabled_website_ids_missing_scheduler_state(&self) -> Result<Vec<i64>> {
+        let ids = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<i64>> {
+                let mut stmt = c.prepare(
+                    "SELECT id FROM websites
+                     WHERE enabled = 1
+                       AND id NOT IN (SELECT website_id FROM scheduler_state)
+                     ORDER BY id",
+                )?;
+                let ids = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                Ok(ids)
+            })
+            .await?;
+        Ok(ids)
+    }
+
+    /// Mark a website's scheduler row as permanently non-schedulable
+    /// (`job_status = 'disabled'`, no lease, no next visit). Used when an
+    /// `enabled = 0` website is encountered at claim/emit time.
+    pub async fn mark_scheduler_state_disabled(&self, website_id: i64) -> Result<()> {
+        self.set_scheduler_state_status(website_id, JobStatus::Disabled, None, 0)
+            .await
+    }
+
+    /// Overwrite a scheduler row's scheduling fields in one shot. `next_visit_at`
+    /// of `None` clears the schedule; `retry_count` is written as given.
+    /// `lease_expires_at` is cleared to `NULL`; `last_execution_at` is preserved.
+    pub async fn set_scheduler_state_status(
+        &self,
+        website_id: i64,
+        job_status: JobStatus,
+        next_visit_at: Option<OffsetDateTime>,
+        retry_count: i64,
+    ) -> Result<()> {
+        let existing = self.get_scheduler_state(website_id).await?;
+        let last_execution_at = existing.and_then(|s| s.last_execution_at);
+        self.upsert_scheduler_state(&SchedulerState {
+            website_id,
+            next_visit_at,
+            last_execution_at,
+            retry_count,
+            job_status,
+            lease_expires_at: None,
+        })
+        .await
+    }
+
+    /// Targeted variant of [`Self::claim_due_job`] used by the scheduler's
+    /// priority queue. Claims `website_id` for execution if — and only if —
+    /// the row is in a claimable state. Runs in a single transaction so the
+    /// state check and the `running` transition are atomic.
+    ///
+    /// * [`ClaimKind::Scheduled`]: row must be `pending`/`retry` and due
+    ///   (`next_visit_at` NULL or `<= now`). This is the normal path and is
+    ///   redundant with [`Self::claim_due_job`], but targets the website the
+    ///   heap popped so emit order follows the in-memory queue.
+    /// * [`ClaimKind::Manual`]: row must be `pending`/`retry`/`paused`; the
+    ///   `next_visit_at` gate is bypassed (manual visits run on user intent).
+    ///
+    /// On success returns the *previous* `job_status` (needed to preserve
+    /// "paused" across a manual visit) and the claimed row. The `UPDATE`
+    /// re-checks the previous `job_status`, so two racing claimants cannot
+    /// both win.
+    pub async fn claim_website_job(
+        &self,
+        website_id: i64,
+        now: OffsetDateTime,
+        lease_seconds: i64,
+        kind: ClaimKind,
+    ) -> Result<Option<(JobStatus, SchedulerState)>> {
+        let lease_s = format_db_ts(now + Duration::seconds(lease_seconds))?;
+        let claimed = self
+            .connection()
+            .call(
+                move |c| -> rusqlite::Result<Option<(JobStatus, SchedulerState)>> {
+                    let tx = c.transaction()?;
+                    let previous = tx
+                        .query_row(
+                            "SELECT website_id, next_visit_at, last_execution_at,
+                                retry_count, job_status, lease_expires_at
+                         FROM scheduler_state WHERE website_id = ?1",
+                            params![website_id],
+                            scheduler_state_from_row,
+                        )
+                        .optional()?;
+                    let Some(previous) = previous else {
+                        return Ok(None);
+                    };
+                    let old_status = previous.job_status;
+                    let claimable_status = match kind {
+                        ClaimKind::Scheduled => {
+                            matches!(old_status, JobStatus::Pending | JobStatus::Retry)
+                        }
+                        ClaimKind::Manual => matches!(
+                            old_status,
+                            JobStatus::Pending | JobStatus::Retry | JobStatus::Paused
+                        ),
+                    };
+                    let due = match kind {
+                        ClaimKind::Scheduled => {
+                            previous.next_visit_at.map(|n| n <= now).unwrap_or(true)
+                        }
+                        ClaimKind::Manual => true,
+                    };
+                    if !claimable_status || !due {
+                        return Ok(None);
+                    }
+                    let updated = tx.execute(
+                        "UPDATE scheduler_state
+                     SET job_status = 'running', lease_expires_at = ?2
+                     WHERE website_id = ?1 AND job_status = ?3",
+                        params![website_id, lease_s, old_status.as_str()],
+                    )?;
+                    if updated != 1 {
+                        return Ok(None);
+                    }
+                    let claimed = tx.query_row(
+                        "SELECT website_id, next_visit_at, last_execution_at,
+                            retry_count, job_status, lease_expires_at
+                     FROM scheduler_state WHERE website_id = ?1",
+                        params![website_id],
+                        scheduler_state_from_row,
+                    )?;
+                    tx.commit()?;
+                    Ok(Some((old_status, claimed)))
+                },
+            )
+            .await?;
+        Ok(claimed)
+    }
+}
+
+/// How the scheduler is claiming a job. See
+/// [`Db::claim_website_job`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// Normal scheduled claim; requires the job to be due.
+    Scheduled,
+    /// Manual "visit now" claim; bypasses the interval/window gates.
+    Manual,
 }
 
 // ---------------------------------------------------------------------------
