@@ -1,7 +1,5 @@
 // The module is the application's public scheduling API, consumed by
-// SEG-10 (executor), SEG-11/15/16 (web/system surfaces). The binary does
-// not call it yet — same pattern as src/db/mod.rs — so silence dead_code
-// for the re-exports until the wiring lands.
+// SEG-10 (executor), SEG-11/15/16 (web/system surfaces).
 #![allow(dead_code, unused_imports)]
 
 //! Scheduler module — jittered interval selection + a bounded,
@@ -11,9 +9,10 @@
 //! * [`queue`] — the [`Scheduler`] worker, the cloneable [`SchedulerHandle`]
 //!   used by the web layer and the executor, and the window math.
 //!
-//! Wiring note: the worker is *not* started in `main` yet — SEG-10
-//! (executor) consumes the dispatch channel and drives
-//! [`SchedulerHandle::handle_completion`].
+//! Wiring note: SEG-10 starts the scheduler from `main` with `tz =`
+//! `Config.tz` and spawns the dispatch-channel consumer: each emitted
+//! [`VisitJob`] goes through `Executor::execute`, and the outcome is fed
+//! back via [`SchedulerHandle::handle_completion`] exactly once.
 
 pub mod jitter;
 pub mod queue;

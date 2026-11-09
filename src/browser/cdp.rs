@@ -999,6 +999,37 @@ impl PageSession {
         .await?;
         Ok(())
     }
+
+    /// Wipe the browser-context-global cookie jar.
+    ///
+    /// Lightpanda 1.0.3 has exactly one (context-global) cookie jar shared
+    /// across all targets; SEG-10 clears it before restoring a profile's jar
+    /// and after the visit's jar has been captured and persisted, so no
+    /// cookie can leak from one profile's visit into the next visit. On any
+    /// error the fallback deletes cookie-by-cookie; callers treat this as
+    /// best-effort hygiene (warn, never fail the visit).
+    pub async fn clear_cookies(&self) -> Result<(), CdpError> {
+        match self.call("Network.clearBrowserCookies", json!({})).await {
+            Ok(_) => Ok(()),
+            Err(primary) => {
+                // Fallback: delete every cookie individually.
+                let cookies = self.get_cookies().await?;
+                let mut last_err = primary;
+                let mut failures = 0usize;
+                for cookie in &cookies {
+                    if let Err(e) = self.delete_cookies(&cookie.name, &cookie.domain).await {
+                        failures += 1;
+                        last_err = e;
+                    }
+                }
+                if cookies.is_empty() || failures == cookies.len() {
+                    // Nothing was cleared; surface the error.
+                    return Err(last_err);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -250,6 +250,24 @@ impl Db {
         Ok(affected > 0)
     }
 
+    /// Record that a visit happened: sets `websites.last_visit_at` and
+    /// `updated_at`. Used by the executor (SEG-10) at the end of every
+    /// visit; `next_visit_at` is owned by the scheduler.
+    /// Returns `true` when a row was actually updated.
+    pub async fn touch_website_last_visit(&self, id: i64, at: OffsetDateTime) -> Result<bool> {
+        let at_s = format_db_ts(at)?;
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "UPDATE websites SET last_visit_at = ?2, updated_at = ?2 WHERE id = ?1",
+                    params![id, at_s],
+                )
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
     /// Delete a website. Dependent `visit_history`, `scheduler_state` and
     /// `interaction_sequences` rows cascade; the linked profile keeps its
     /// cookies (they are only cleared when the *profile* is deleted).

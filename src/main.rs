@@ -1,7 +1,8 @@
 //! uptimePanda — lightweight browser keep-alive & synthetic monitoring.
 //! Boots an HTTP listener exposing `/health`. SEG-04: resolves the
 //! deployment config from the environment, seeds the DB-backed settings,
-//! then serves.
+//! then serves. SEG-10: starts the scheduler + executor job loop (visit
+//! gate honoured inside `Executor::execute`).
 
 mod browser;
 mod config;
@@ -38,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    let config = std::sync::Arc::new(config);
 
     // Create the parent directory for the database file (no-op when it exists).
     if let Some(parent) = config.database_path.parent()
@@ -56,8 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // SEG-06: persistent Lightpanda process manager (recycle on >memory_restart_mb
-    // RSS or crash only). Deeper wiring (scheduler/executor, System page) lands
-    // in SEG-08/SEG-10/SEG-15/SEG-16 and is intentionally NOT done here.
+    // RSS or crash only). The health task auto-spawns the browser at boot.
     // Dev ergonomics: if the binary is absent, log and continue serving /health.
     // BROWSER_BINARY overrides the binary path; LIGHTPANDA_CDP_PORT overrides
     // the base CDP port (default 9222, scanned upward on conflict).
@@ -85,13 +86,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         None
     };
-    // SEG-08: scheduler module is implemented (jitter, priority queue,
-    // active windows, recovery, pause/resume) but is NOT started here on
-    // purpose — the dispatch channel it emits on is consumed by the
-    // executor. SEG-10 spawns it:
-    //   let (tx, rx) = tokio::sync::mpsc::channel(1);
-    //   let handle = scheduler::Scheduler::from_env_tz(db.clone()).start(tx);
-    // (handle_completion + enqueue_manual/set_paused live on SchedulerHandle)
+    // SEG-10: start the scheduler + executor. The scheduler emits claimed
+    // jobs onto a capacity-1 dispatch channel; this consumer loop runs the
+    // visit and reports the outcome back to the scheduler exactly once.
+    // Panics in a visit are converted into `interaction_error` completions —
+    // they never take down the worker or the HTTP listener.
+    let mut scheduler_handle: Option<scheduler::SchedulerHandle> = None;
+    if let Some(mgr) = &manager {
+        let (tx, rx) = tokio::sync::mpsc::channel::<scheduler::VisitJob>(1);
+        // Deployment-default timezone comes from Config.tz (TZ env, UTC fallback).
+        let sched = scheduler::Scheduler::new(db.clone(), config.tz.clone()).start(tx);
+        let exec = std::sync::Arc::new(executor::Executor::new(
+            db.clone(),
+            std::sync::Arc::clone(mgr),
+            config.encryption_key.clone(),
+            std::sync::Arc::clone(&config),
+        ));
+        let sched_for_loop = sched.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(job) = rx.recv().await {
+                let trigger = match job.trigger {
+                    scheduler::Trigger::Scheduled => executor::ExecutionTrigger::Scheduled,
+                    scheduler::Trigger::Manual => executor::ExecutionTrigger::Manual,
+                };
+                let website_id = job.website_id;
+                let exec_for_job = std::sync::Arc::clone(&exec);
+                // Isolate the visit in its own task so a panic cannot kill
+                // the consumer; completion is reported exactly once either way.
+                let join =
+                    tokio::spawn(async move { exec_for_job.execute(website_id, trigger).await });
+                match join.await {
+                    Ok(outcome) => {
+                        tracing::info!(
+                            website_id,
+                            outcome = ?outcome.outcome,
+                            duration_ms = outcome.duration.as_millis() as u64,
+                            http_status = outcome.http_status,
+                            final_url = outcome.final_url.as_deref(),
+                            memory_usage = outcome.memory_usage,
+                            "visit finished"
+                        );
+                        if let Err(e) = sched_for_loop
+                            .handle_completion(
+                                website_id,
+                                executor::completion_outcome(outcome.outcome),
+                            )
+                            .await
+                        {
+                            tracing::error!(website_id, error = %e,
+                                "failed to report scheduler completion");
+                        }
+                    }
+                    Err(join_err) => {
+                        tracing::error!(website_id, error = %join_err,
+                            "visit task panicked; recording interaction_error");
+                        if let Err(e) = sched_for_loop
+                            .handle_completion(website_id, db::Outcome::InteractionError)
+                            .await
+                        {
+                            tracing::error!(website_id, error = %e,
+                                "failed to report scheduler completion after panic");
+                        }
+                    }
+                }
+            }
+            tracing::warn!("scheduler dispatch channel closed; executor consumer exiting");
+        });
+        scheduler_handle = Some(sched);
+        tracing::info!("scheduler and executor started");
+    } else {
+        tracing::warn!("lightpanda unavailable; scheduler not started (no jobs will be emitted)");
+    }
+    // Kept for SEG-11/16 (pause/resume/web API) and SEG-21 (shutdown).
+    let _scheduler_handle = scheduler_handle;
     let _browser_manager = manager;
 
     let app = Router::new()
