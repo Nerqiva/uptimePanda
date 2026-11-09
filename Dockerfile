@@ -65,7 +65,7 @@ ARG GITHUB_SHA=
 # curl is kept in the final image on purpose (decision, documented in the
 # README/report): the HEALTHCHECK below uses it, and it is handy for operators.
 # ca-certificates is required — Lightpanda makes outbound TLS connections to
-# the monitored sites. tzdata for TZ=UTC and timezone-aware scheduling logs.
+# the monitored sites. tzdata for Asia/Omsk (UTC+6) and timezone-aware logs.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tzdata curl \
  && rm -rf /var/lib/apt/lists/*
@@ -141,7 +141,7 @@ ENV PORT=8080 \
     BIND_ADDR=0.0.0.0 \
     DATABASE_PATH=/app/data/uptimepanda.db \
     BACKUP_DIR=/app/data/backups \
-    TZ=UTC \
+    TZ=Asia/Omsk \
     LIGHTPANDA_CDP_PORT=9222 \
     RUST_LOG=info \
     LIGHTPANDA_DISABLE_TELEMETRY=true \

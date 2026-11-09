@@ -126,7 +126,7 @@ environment.
 | `BACKUP_DIR` | no | `/app/data/backups` (container) · `./data/backups` (dev) | Directory for database backups. |
 | `PORT` | no | `8080` | HTTP listen port. |
 | `BIND_ADDR` | no | `127.0.0.1` (dev) · `0.0.0.0` (image) | Bind address. Containers need `0.0.0.0`. |
-| `TZ` | no | `UTC` | Timezone (IANA name); default for per-website active windows. |
+| `TZ` | no | `Asia/Omsk` | Timezone (IANA name); default for per-website active windows. |
 | `RUST_LOG` | no | `info` | Log filter (`trace`/`debug`/`info`/`warn`/`error` or an EnvFilter directive). |
 <!-- env:end -->
 

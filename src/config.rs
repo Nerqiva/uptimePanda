@@ -64,7 +64,7 @@ impl Config {
     ///
     /// Defaults (dev ergonomics): `DATABASE_PATH=./data/uptimepanda.db`,
     /// `BACKUP_DIR=./data/backups` (next to the db), `PORT=8080`,
-    /// `BIND_ADDR=127.0.0.1`, `TZ=UTC`, `RUST_LOG=info`.
+    /// `BIND_ADDR=127.0.0.1`, `TZ=Asia/Omsk`, `RUST_LOG=info`.
     ///
     /// `APP_PASSWORD` (min 12 chars) and `ENCRYPTION_KEY` (min 16 chars) are
     /// required. All problems are collected and reported as one multiline
@@ -140,7 +140,7 @@ impl Config {
             },
         };
 
-        let tz = get("TZ").unwrap_or_else(|| "UTC".to_string());
+        let tz = get("TZ").unwrap_or_else(|| "Asia/Omsk".to_string());
         let log_level = get("RUST_LOG").unwrap_or_else(|| "info".to_string());
 
         if !problems.is_empty() {
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(cfg.backup_dir, PathBuf::from("./data/backups"));
         assert_eq!(cfg.port, 8080);
         assert_eq!(cfg.bind_addr, IpAddr::from([127, 0, 0, 1]));
-        assert_eq!(cfg.tz, "UTC");
+        assert_eq!(cfg.tz, "Asia/Omsk");
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.app_password, "correct-horse-battery");
         assert_eq!(cfg.encryption_key, "0123456789abcdef");

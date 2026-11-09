@@ -900,7 +900,7 @@ impl SchedulerHandle {
 
 /// Deployment-default timezone (`TZ`), read at scheduler start.
 fn tz_env() -> String {
-    std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string())
+    std::env::var("TZ").unwrap_or_else(|_| "Asia/Omsk".to_string())
 }
 
 /// The scheduler itself. Owns the DB handle and the shared heap; use
