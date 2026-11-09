@@ -57,6 +57,11 @@ pub enum DbError {
 
     #[error("invalid backup: {0}")]
     InvalidBackup(String),
+
+    /// A caller supplied or read a value that failed validation
+    /// (unknown key, out-of-bounds value, or a cross-field invariant).
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl From<tokio_rusqlite::Error<rusqlite::Error>> for DbError {

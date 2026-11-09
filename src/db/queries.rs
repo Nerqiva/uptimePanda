@@ -362,3 +362,84 @@ impl Db {
         Ok(recovered as u64)
     }
 }
+
+// ---------------------------------------------------------------------------
+// application_settings — deliberately tiny raw helpers; typed access and
+// validation live in `crate::config`.
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Read a raw `application_settings` value, if the key is present.
+    pub async fn get_application_setting(&self, key: &str) -> Result<Option<String>> {
+        let key = key.to_owned();
+        let value = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Option<String>> {
+                c.query_row(
+                    "SELECT setting_value FROM application_settings WHERE setting_key = ?1",
+                    params![key],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        Ok(value)
+    }
+
+    /// Insert the key/value only if the key is absent. Returns `true` when a
+    /// row was inserted (i.e. the seed was applied), `false` when the key
+    /// already existed.
+    pub async fn seed_application_setting_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        let inserted = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "INSERT OR IGNORE INTO application_settings
+                        (setting_key, setting_value, updated_at)
+                     VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    params![key, value],
+                )
+            })
+            .await?;
+        Ok(inserted > 0)
+    }
+
+    /// Insert or overwrite a raw `application_settings` value.
+    pub async fn upsert_application_setting(&self, key: &str, value: &str) -> Result<()> {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        self.connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "INSERT INTO application_settings
+                        (setting_key, setting_value, updated_at)
+                     VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                     ON CONFLICT(setting_key) DO UPDATE SET
+                        setting_value = excluded.setting_value,
+                        updated_at = excluded.updated_at",
+                    params![key, value],
+                )
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// All `application_settings` rows as `(key, value)` pairs, ordered by key.
+    pub async fn all_application_settings(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<(String, String)>> {
+                let mut stmt = c.prepare(
+                    "SELECT setting_key, setting_value FROM application_settings ORDER BY setting_key",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+}

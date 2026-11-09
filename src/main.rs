@@ -1,5 +1,7 @@
 //! uptimePanda — lightweight browser keep-alive & synthetic monitoring.
-//! SEG-02 scaffold: binary boots an HTTP listener exposing `/health`.
+//! Boots an HTTP listener exposing `/health`. SEG-04: resolves the
+//! deployment config from the environment, seeds the DB-backed settings,
+//! then serves.
 
 mod browser;
 mod config;
@@ -28,16 +30,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
+    let config = match config::Config::from_env() {
+        Ok(c) => c,
+        Err(msg) => {
+            // Secrets are never printed; `msg` describes missing/invalid vars only.
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
+
+    // Create the parent directory for the database file (no-op when it exists).
+    if let Some(parent) = config.database_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let db = db::Db::open(&config.database_path).await?;
+    config::seed_settings(&db).await?;
 
     let app = Router::new()
         .route("/health", get(health))
         .fallback(not_found);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = std::net::SocketAddr::from((config.bind_addr, config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, version = VERSION.trim(), "uptimepanda listening");
     axum::serve(listener, app).await?;
