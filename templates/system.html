@@ -42,7 +42,7 @@
   {% else %}
   <table class="table">
     <thead>
-      <tr><th>Name</th><th>Size</th><th>Modified (UTC)</th><th></th></tr>
+      <tr><th>Name</th><th>Size</th><th>Modified (local)</th><th></th></tr>
     </thead>
     <tbody>
       {% for b in backups %}
@@ -93,7 +93,7 @@
   {% else %}
   <table class="table">
     <thead>
-      <tr><th>Time (UTC)</th><th>Event</th><th>Memory</th><th>Details</th></tr>
+      <tr><th>Time (local)</th><th>Event</th><th>Memory</th><th>Details</th></tr>
     </thead>
     <tbody>
       {% for ev in events %}

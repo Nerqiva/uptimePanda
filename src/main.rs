@@ -44,6 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    // All UI timestamps render in the configured display TZ. An invalid IANA
+    // name was already rejected above (or falls back with a warn here).
+    match config.tz.parse::<chrono_tz::Tz>() {
+        Ok(tz) => web::templates::set_display_tz(tz),
+        Err(e) => {
+            tracing::warn!(tz = %config.tz, error = %e, "unparseable TZ; falling back to Asia/Omsk for UI timestamps");
+        }
+    }
     let config = std::sync::Arc::new(config);
 
     // Create the parent directory for the database file (no-op when it exists).

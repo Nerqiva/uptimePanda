@@ -15,6 +15,38 @@ use crate::state::AppState;
 use crate::web::csrf;
 
 // ---------------------------------------------------------------------------
+// Display timezone
+// ---------------------------------------------------------------------------
+
+/// Deployment display timezone (`TZ`). Set once at boot from `Config.tz`;
+/// every UI timestamp renders in it. DB rows store UTC — this only flips
+/// rendering. Defaults to Asia/Omsk before `set_display_tz` is called.
+static DISPLAY_TZ: once_cell::sync::OnceCell<chrono_tz::Tz> = once_cell::sync::OnceCell::new();
+
+/// Set the display timezone (call once at boot). Later calls are ignored.
+pub fn set_display_tz(tz: chrono_tz::Tz) {
+    let _ = DISPLAY_TZ.set(tz);
+}
+
+/// The display timezone; falls back to Asia/Omsk if not set.
+pub fn display_tz() -> chrono_tz::Tz {
+    *DISPLAY_TZ.get().unwrap_or(&chrono_tz::Tz::Asia__Omsk)
+}
+
+/// Format timestamps for the UI: `YYYY-MM-DD HH:MM:SS` in the display TZ.
+fn format_in_display_tz(t: &OffsetDateTime) -> Option<String> {
+    let rfc = t
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()?;
+    let utc = chrono::DateTime::parse_from_rfc3339(&rfc).ok()?;
+    Some(
+        utc.with_timezone(&display_tz())
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Shared chrome
 // ---------------------------------------------------------------------------
 
@@ -64,11 +96,8 @@ pub fn error_page(status: StatusCode, code: &str, message: &str) -> Response {
 // Formatting helpers (pre-format in handlers; templates stay dumb)
 // ---------------------------------------------------------------------------
 
-const TS_FMT: &[time::format_description::FormatItem<'_>] =
-    time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-
 pub fn ts(t: &OffsetDateTime) -> String {
-    t.format(TS_FMT).unwrap_or_else(|_| t.to_string())
+    format_in_display_tz(t).unwrap_or_else(|| t.to_string())
 }
 
 pub fn ts_opt(t: &Option<OffsetDateTime>) -> String {

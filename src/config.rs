@@ -141,6 +141,11 @@ impl Config {
         };
 
         let tz = get("TZ").unwrap_or_else(|| "Asia/Omsk".to_string());
+        if tz.parse::<chrono_tz::Tz>().is_err() {
+            problems.push(format!(
+                "TZ={tz:?} is not a known IANA timezone (e.g. Asia/Omsk, UTC, Europe/Berlin)"
+            ));
+        }
         let log_level = get("RUST_LOG").unwrap_or_else(|| "info".to_string());
 
         if !problems.is_empty() {
@@ -710,6 +715,16 @@ mod tests {
         assert_eq!(cfg.bind_addr, IpAddr::from([0, 0, 0, 0]));
         assert_eq!(cfg.tz, "Europe/Berlin");
         assert_eq!(cfg.log_level, "debug");
+    }
+
+    #[test]
+    fn invalid_tz_is_an_error() {
+        for bogus in ["Mars/Olympus_Mons", "Omsk", "UTC+6"] {
+            let mut pairs = valid_env();
+            pairs.push(("TZ", bogus));
+            let err = Config::resolve(&env_with(&pairs)).expect_err("invalid TZ must fail");
+            assert!(err.contains("TZ"), "error names TZ {bogus:?}: {err}");
+        }
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub struct OverviewPage {
 pub struct UpcomingVisitView {
     pub website_name: String,
     pub profile_name: String,
-    /// `fmt_ts_local` + relative suffix, e.g. `2026-11-09 15:04:05 UTC`.
+    /// `fmt_ts_local` + relative suffix, e.g. `2026-11-09 15:04:05 Asia/Omsk`.
     pub next_visit_label: String,
     pub time_until_label: String,
 }
@@ -546,10 +546,11 @@ pub(crate) fn time_until_at(t: &OffsetDateTime, now: OffsetDateTime) -> String {
     }
 }
 
-/// Table timestamp with an explicit UTC suffix (`2026-11-09 15:04:05 UTC`).
-/// Mirrors the `Started (UTC)` column convention used by the history table.
+/// Table timestamp in the deployment display timezone
+/// (`DISPLAY_TZ` / `TZ`), e.g. `2026-11-09 15:04:05`. Column headers say
+/// `(local)`.
 pub fn fmt_ts_local(t: &OffsetDateTime) -> String {
-    format!("{} UTC", crate::web::templates::ts(t))
+    crate::web::templates::ts(t)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,11 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn fmt_ts_local_appends_utc_suffix() {
+    fn fmt_ts_local_renders_body_without_suffix() {
         let t = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("epoch");
         let out = fmt_ts_local(&t);
-        assert!(out.ends_with(" UTC"), "suffix present: {out}");
-        assert!(out.len() > 5, "timestamp body present: {out}");
+        assert!(!out.ends_with("UTC"), "no UTC suffix: {out}");
+        assert_eq!(out.len(), 19, "YYYY-MM-DD HH:MM:SS body: {out}");
     }
 
     #[test]
