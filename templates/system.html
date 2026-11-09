@@ -8,6 +8,16 @@
     {% if stats.tight_budget %}<span class="pill warn">tight memory (&lt;350 MB available)</span>{% endif %}
     {% if stats.db_over_warn %}<span class="pill warn">db over {{ stats.db_warn_mb }} MB</span>{% endif %}
   </div>
+  {% if restore_pending %}
+  <div class="restore-pending-banner" role="alert">
+    <p><strong>RESTORE PENDING — restart the application to load the restored database.</strong></p>
+    <p class="restore-pending-sub">Visits are refused while a restore is pending. The previous database was kept as a <code>.db.bak-&lt;ts&gt;</code> file next to the live database. Restart the process, then acknowledge below to re-enable visits.</p>
+    <form method="post" action="/backup/restore/ack" hx-post="/backup/restore/ack" hx-swap="none">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <button class="btn small danger" type="submit" data-confirm="Acknowledge the pending restore and re-enable visits?|Acknowledge">Acknowledge restore</button>
+    </form>
+  </div>
+  {% endif %}
   <div id="system-stats" hx-get="/fragments/system" hx-trigger="load, every 3s" hx-swap="innerHTML">
     {% include "partials/system_stats.html" %}
   </div>
@@ -20,8 +30,40 @@
       <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
       <button class="btn" type="submit">Back up database</button>
     </form>
+    <a class="btn ghost" href="/backup/download">Download database backup</a>
   </div>
-  <p class="muted">Backups are written to the server-local <code>BACKUP_DIR</code> via <code>VACUUM INTO</code>. The backup file is not streamed over HTTP here — it stays on disk; streaming download lands in SEG-16.</p>
+  <p class="muted">Backups are written to the server-local <code>BACKUP_DIR</code> via <code>VACUUM INTO</code>. The one-click download streams a fresh snapshot (<code>VACUUM INTO</code> a temporary copy, deleted after the response is built) — the live database is never streamed mid-WAL.</p>
+</div>
+
+<div class="card">
+  <h2 class="section-title">Backup files</h2>
+  {% if backups.is_empty() %}
+  <p class="muted">No backup files in <code>BACKUP_DIR</code> yet. Use "Back up database" above to create one.</p>
+  {% else %}
+  <table class="table">
+    <thead>
+      <tr><th>Name</th><th>Size</th><th>Modified (UTC)</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for b in backups %}
+      <tr>
+        <td class="muted">{{ b.name }}</td>
+        <td>{{ b.size_label }}</td>
+        <td class="muted">{{ b.mtime_label }}</td>
+        <td>
+          <div class="btn-row">
+            <a class="btn small ghost" href="/backup/download?path={{ b.name }}">Download</a>
+            <form method="post" action="/backup/delete?path={{ b.name }}" hx-post="/backup/delete?path={{ b.name }}" hx-swap="none">
+              <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+              <button class="btn small danger" type="submit" data-confirm="Delete backup {{ b.name }}?|Delete">Delete</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -42,8 +84,12 @@
 
 <div class="card">
   <h2 class="section-title">Recent browser events</h2>
+  <div class="chiprow" role="group" aria-label="Filter by event type">
+    <a class="chip{% if event_type == "" %} active{% endif %}" href="/system">all</a>
+    {% for chip in event_type_chips %}<a class="chip{% if chip.active %} active{% endif %}" href="{{ chip.href }}">{{ chip.label }}</a>{% endfor %}
+  </div>
   {% if events.is_empty() %}
-  <p class="muted">No browser events recorded yet.</p>
+  <p class="muted">No browser events recorded{% if event_type != "" %} for <code>{{ event_type }}</code>{% endif %} yet.</p>
   {% else %}
   <table class="table">
     <thead>

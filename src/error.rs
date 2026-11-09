@@ -14,6 +14,8 @@ pub enum AppError {
     Db(DbError),
     Render(askama::Error),
     Internal(String),
+    /// 400 — the request is invalid (carries a static, non-secret message).
+    BadRequest(String),
 }
 
 impl From<DbError> for AppError {
@@ -28,6 +30,11 @@ impl IntoResponse for AppError {
             Self::Db(e) => tracing::error!(error = %e, "database error"),
             Self::Render(e) => tracing::error!(error = %e, "template render error"),
             Self::Internal(msg) => tracing::error!(%msg, "internal error"),
+            Self::BadRequest(_) => {}
+        }
+        if let Self::BadRequest(msg) = &self {
+            // Static, non-secret message — safe to render verbatim.
+            return crate::web::templates::error_page(StatusCode::BAD_REQUEST, "400", msg);
         }
         crate::web::templates::error_page(
             StatusCode::INTERNAL_SERVER_ERROR,

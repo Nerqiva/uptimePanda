@@ -9,4 +9,28 @@
     {% include "partials/overview_grid.html" %}
   </div>
 </div>
+<div class="card">
+  <h2 class="section-title">Upcoming visits</h2>
+  {% if upcoming.is_empty() %}
+  <div class="empty-state">
+    <h2>No visits scheduled</h2>
+    <p class="muted">Enabled monitors appear here with their next scheduled run.</p>
+  </div>
+  {% else %}
+  <table class="table">
+    <thead>
+      <tr><th>Site</th><th>Next visit (UTC)</th><th>Profile</th></tr>
+    </thead>
+    <tbody>
+      {% for u in upcoming %}
+      <tr>
+        <td>{{ u.website_name }}</td>
+        <td>{{ u.next_visit_label }} <span class="muted">({{ u.time_until_label }})</span></td>
+        <td>{{ u.profile_name }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
 {% endblock %}

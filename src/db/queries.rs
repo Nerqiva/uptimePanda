@@ -1178,6 +1178,14 @@ pub struct WebsiteListEntry {
     pub next_visit_at: Option<OffsetDateTime>,
 }
 
+/// One row of the overview "Upcoming visits" table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpcomingVisit {
+    pub website_name: String,
+    pub profile_name: Option<String>,
+    pub next_visit_at: OffsetDateTime,
+}
+
 impl Db {
     /// Total number of websites.
     pub async fn count_websites(&self) -> Result<i64> {
@@ -1282,18 +1290,66 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// The next `limit` upcoming visits (pending/retry jobs on enabled
+    /// websites), earliest first, with the profile name joined in.
+    /// `limit` is clamped to `1..=50`.
+    pub async fn upcoming_visits(&self, limit: i64) -> Result<Vec<UpcomingVisit>> {
+        let limit = limit.clamp(1, 50);
+        let rows = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Vec<UpcomingVisit>> {
+                let mut stmt = c.prepare(
+                    "SELECT w.name AS website_name, p.name AS profile_name,
+                            s.next_visit_at AS next_visit_at
+                     FROM scheduler_state s
+                     JOIN websites w ON w.id = s.website_id
+                     LEFT JOIN browser_profiles p ON p.id = w.profile_id
+                     WHERE s.next_visit_at IS NOT NULL
+                       AND s.job_status IN ('pending', 'retry')
+                       AND w.enabled = 1
+                     ORDER BY s.next_visit_at ASC
+                     LIMIT ?1",
+                )?;
+                let rows = stmt
+                    .query_map(params![limit], |row| {
+                        Ok(UpcomingVisit {
+                            website_name: row.get("website_name")?,
+                            profile_name: row.get("profile_name")?,
+                            next_visit_at: parse_db_ts(&row.get::<_, String>("next_visit_at")?, 2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
     /// Newest `browser_events` rows (newest first), `limit` clamped to 0..=500.
     pub async fn recent_browser_events(&self, limit: i64) -> Result<Vec<BrowserEvent>> {
+        self.recent_browser_events_filtered(limit, None).await
+    }
+
+    /// Newest `browser_events` rows, optionally filtered by exact
+    /// `event_type`, newest first, `limit` clamped to 0..=500.
+    pub async fn recent_browser_events_filtered(
+        &self,
+        limit: i64,
+        event_type: Option<&str>,
+    ) -> Result<Vec<BrowserEvent>> {
         let limit = limit.clamp(0, 500);
+        let event_type = event_type.map(|s| s.to_string());
         let rows = self
             .connection()
             .call(move |c| -> rusqlite::Result<Vec<BrowserEvent>> {
                 let mut stmt = c.prepare(
                     "SELECT id, event_type, timestamp, memory_usage, details
-                     FROM browser_events ORDER BY id DESC LIMIT ?1",
+                     FROM browser_events
+                     WHERE (?2 IS NULL OR event_type = ?2)
+                     ORDER BY id DESC LIMIT ?1",
                 )?;
                 let rows = stmt
-                    .query_map(params![limit], |row| {
+                    .query_map(params![limit, event_type], |row| {
                         Ok(BrowserEvent {
                             id: row.get(0)?,
                             event_type: row.get(1)?,

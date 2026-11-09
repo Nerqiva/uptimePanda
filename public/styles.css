@@ -1662,3 +1662,30 @@ button[disabled] {
     justify-content: flex-start;
   }
 }
+
+/* ---- SEG-16 additive: restore-pending banner ----
+   Unmissable red banner shown while a database restore is pending
+   (flag or application_settings restore_pending='1'). Additive only. */
+.restore-pending-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid var(--err);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  color: var(--err);
+}
+.restore-pending-banner p {
+  margin: 0;
+}
+.restore-pending-sub {
+  color: var(--text);
+  font-weight: 400;
+  font-size: 12px;
+}
+.restore-pending-banner code {
+  color: var(--err);
+}

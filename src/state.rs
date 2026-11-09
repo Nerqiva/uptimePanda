@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use crate::browser::manager::BrowserManager;
@@ -34,6 +35,17 @@ pub struct AppState {
     /// Process boot, stamped at construction — powers `uptime_s` in
     /// `/api/system`.
     pub boot_instant: Instant,
+    /// In-memory marker shared with the executor — set by the restore
+    /// handler to signal "a database restore was activated in *this*
+    /// process" (the live file was swapped; the still-open connection
+    /// points at the old inode). The executor's pre-flight guard refuses
+    /// visits while this is set, and the System page shows the
+    /// restore-pending banner. Process-local by design; the durable
+    /// marker is the `restore_pending` row in the *restored* database's
+    /// `application_settings` (written before the swap), which re-arms the
+    /// banner + guard after a restart. Shared as an `Arc` with the
+    /// executor — a plain `AtomicBool` cannot be seen by both.
+    pub restore_pending: Arc<AtomicBool>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -45,6 +57,7 @@ impl AppState {
         scheduler: Option<SchedulerHandle>,
         config: &Config,
         version: &'static str,
+        restore_pending: Arc<AtomicBool>,
     ) -> Self {
         use sha2::Digest as _;
         let session_key: [u8; 32] = sha2::Sha256::digest(
@@ -62,6 +75,7 @@ impl AppState {
             backup_dir: config.backup_dir.clone(),
             version,
             boot_instant: Instant::now(),
+            restore_pending,
         }
     }
 }

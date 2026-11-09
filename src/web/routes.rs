@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use askama::Template;
 use axum::extract::{Extension, Form, Path, Query, State};
@@ -26,7 +27,7 @@ use axum::routing::{get, patch, post};
 use serde::Deserialize;
 
 use crate::browser::sessions::USER_AGENT_PRESETS;
-use crate::db::queries::{HistoryEntry, WebsiteListEntry};
+use crate::db::queries::{HistoryEntry, UpcomingVisit, WebsiteListEntry};
 use crate::db::{MonitoringMode, Outcome};
 use crate::error::AppError;
 use crate::security;
@@ -94,6 +95,10 @@ pub fn build_router(state: SharedState) -> axum::Router {
             post(backup_restore)
                 .route_layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
+        // Streaming download + listing management (SEG-16).
+        .route("/backup/download", get(backup_download))
+        .route("/backup/delete", post(backup_delete))
+        .route("/backup/restore/ack", post(backup_restore_ack))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -360,13 +365,36 @@ async fn collect_overview(state: &AppState) -> Result<OverviewStats, AppError> {
     })
 }
 
+/// Render-ready rows of the overview "Upcoming visits" table (next 5,
+/// earliest first). Separate from [`collect_overview`] so the 3-second
+/// polling fragment does not pay for the extra join every tick.
+async fn collect_upcoming_visits(state: &AppState) -> Result<Vec<UpcomingVisitView>, AppError> {
+    Ok(state
+        .db
+        .upcoming_visits(5)
+        .await?
+        .into_iter()
+        .map(|u: UpcomingVisit| UpcomingVisitView {
+            website_name: u.website_name,
+            profile_name: u.profile_name.unwrap_or_else(|| "—".to_string()),
+            next_visit_label: fmt_ts_local(&u.next_visit_at),
+            time_until_label: time_until(&u.next_visit_at),
+        })
+        .collect())
+}
+
 async fn overview_page(
     State(state): State<SharedState>,
     session: Extension<SessionInfo>,
 ) -> Result<Response, AppError> {
     let stats = collect_overview(&state).await?;
+    let upcoming = collect_upcoming_visits(&state).await?;
     let chrome = build_chrome(&state, "Overview", "overview", &session);
-    html(templates::render_ok(&OverviewPage { chrome, stats }))
+    html(templates::render_ok(&OverviewPage {
+        chrome,
+        stats,
+        upcoming,
+    }))
 }
 
 async fn overview_fragment(
@@ -432,16 +460,25 @@ async fn collect_system_stats(state: &AppState) -> Result<SystemStatsView, AppEr
     })
 }
 
+/// Query params for the System page: the browser-events `event_type`
+/// chip filter (`""`/absent = all).
+#[derive(Deserialize)]
+pub struct SystemQuery {
+    event_type: Option<String>,
+}
+
 async fn system_page(
     State(state): State<SharedState>,
     session: Extension<SessionInfo>,
+    Query(query): Query<SystemQuery>,
 ) -> Result<Response, AppError> {
     let chrome = build_chrome(&state, "System", "system", &session);
     let browser_available = state.manager.is_some();
     let stats = collect_system_stats(&state).await?;
+    let event_type = normalize_event_type(query.event_type.as_deref());
     let events = state
         .db
-        .recent_browser_events(50)
+        .recent_browser_events_filtered(50, event_type)
         .await?
         .into_iter()
         .map(|ev| BrowserEventView {
@@ -462,11 +499,25 @@ async fn system_page(
                 .unwrap_or_default(),
         })
         .collect();
+    let event_type_chips = EVENT_TYPE_OPTIONS
+        .iter()
+        .map(|o| EventTypeChipView {
+            label: o.label,
+            href: format!("/system?event_type={}", o.value),
+            active: event_type == Some(o.value),
+        })
+        .collect();
+    let backups = collect_backup_files(&state);
+    let restore_pending = restore_pending_active(&state).await;
     html(templates::render_ok(&SystemPage {
         chrome,
         browser_available,
         events,
         stats,
+        backups,
+        restore_pending,
+        event_type: event_type.unwrap_or("").to_string(),
+        event_type_chips,
     }))
 }
 
@@ -1642,6 +1693,21 @@ async fn interactions_clear(
 
 const HISTORY_PAGE_SIZE: i64 = 20;
 
+/// Clamp `requested` into `1..=total_pages` and compute the total page
+/// count, given `total` rows of `page_size`. An empty result set reports
+/// a single, valid page 1 (never "Page 1 of 0").
+pub(crate) fn clamp_page(requested: Option<i64>, total: i64, page_size: i64) -> (i64, i64) {
+    let page_size = page_size.max(1);
+    let total = total.max(0);
+    let total_pages = if total == 0 {
+        1
+    } else {
+        (total + page_size - 1) / page_size
+    };
+    let page = requested.unwrap_or(1).clamp(1, total_pages);
+    (page, total_pages)
+}
+
 #[derive(Deserialize)]
 pub struct HistoryQuery {
     website_id: Option<i64>,
@@ -1671,6 +1737,38 @@ fn history_filter_query(website_id: Option<i64>, outcome: Option<&str>) -> Strin
         parts.push(format!("outcome={o}"));
     }
     parts.join("&")
+}
+
+/// Absolute href for a history filter combination — the single place
+/// history URLs are built (chips, pagination links stay relative and use
+/// `history_filter_query`).
+fn history_chip_href(website_id: Option<i64>, outcome: Option<&str>) -> String {
+    let fq = history_filter_query(website_id, outcome);
+    if fq.is_empty() {
+        "/history".to_string()
+    } else {
+        format!("/history?{fq}")
+    }
+}
+
+/// Outcome filter chips (`all` first), each preserving the current
+/// `website_id`. `selected_outcome` is the raw string from the query
+/// (empty string = all).
+fn history_outcome_chips(website_id: Option<i64>, selected_outcome: &str) -> Vec<ChipView> {
+    let mut chips = Vec::with_capacity(OUTCOME_OPTIONS.len() + 1);
+    chips.push(ChipView {
+        label: "all".to_string(),
+        href: history_chip_href(website_id, None),
+        active: selected_outcome.is_empty(),
+    });
+    for o in &OUTCOME_OPTIONS {
+        chips.push(ChipView {
+            label: o.label.to_string(),
+            href: history_chip_href(website_id, Some(o.value)),
+            active: selected_outcome == o.value,
+        });
+    }
+    chips
 }
 
 fn history_row_view(entry: HistoryEntry) -> HistoryRowView {
@@ -1712,8 +1810,7 @@ async fn history_selection(
     let outcome = parse_outcome_param(query.outcome.as_deref());
     let selected_outcome = outcome.map(|o| o.as_str().to_string()).unwrap_or_default();
     let total = state.db.count_history(website_id, outcome).await?;
-    let total_pages = (total + HISTORY_PAGE_SIZE - 1) / HISTORY_PAGE_SIZE;
-    let page = query.page.unwrap_or(1).clamp(1, total_pages.max(1));
+    let (page, total_pages) = clamp_page(query.page, total, HISTORY_PAGE_SIZE);
     Ok(HistorySelection {
         website_id,
         outcome,
@@ -1764,8 +1861,8 @@ async fn history_page(
     html(templates::render_ok(&HistoryPage {
         chrome,
         websites,
-        outcomes: &OUTCOME_OPTIONS,
         selected_website: sel.website_id.unwrap_or(0),
+        outcome_chips: history_outcome_chips(sel.website_id, &sel.selected_outcome),
         selected_outcome: sel.selected_outcome,
         total: sel.total,
         page: sel.page,
@@ -1795,6 +1892,150 @@ async fn history_rows_fragment(
 // ---------------------------------------------------------------------------
 // Backup / restore
 // ---------------------------------------------------------------------------
+
+/// Hard cap for a streamed backup download (64 MB). Typical database
+/// sizes are far below this; bigger files are refused with 400.
+const BACKUP_DOWNLOAD_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bare-filename validation for any user-supplied backup path segment:
+/// `^[A-Za-z0-9._-]+$`, not `.`/`..`, at most 128 bytes. Anything else is
+/// rejected with 400 before touching the filesystem.
+fn valid_backup_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// Resolve `dir/name`, refusing anything that escapes `dir` (symlink or
+/// otherwise). Returns the canonical path.
+fn resolve_backup_file(dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf, AppError> {
+    let canon_dir = std::fs::canonicalize(dir)
+        .map_err(|e| AppError::Internal(format!("canonicalize backup dir: {e}")))?;
+    let canon = std::fs::canonicalize(dir.join(name))
+        .map_err(|_| AppError::BadRequest("backup not found".to_string()))?;
+    if !canon.starts_with(&canon_dir) {
+        return Err(AppError::BadRequest(
+            "backup path escapes the backup directory".to_string(),
+        ));
+    }
+    Ok(canon)
+}
+
+/// Read `path` into memory after enforcing the download cap, then remove
+/// the file — always, on every path, so streaming temporaries never leak.
+fn read_and_remove(path: &std::path::Path) -> Result<Vec<u8>, AppError> {
+    let result = (|| {
+        let meta =
+            std::fs::metadata(path).map_err(|e| AppError::Internal(format!("stat backup: {e}")))?;
+        if !meta.is_file() {
+            return Err(AppError::BadRequest("not a regular file".to_string()));
+        }
+        if meta.len() > BACKUP_DOWNLOAD_CAP_BYTES {
+            return Err(AppError::BadRequest(format!(
+                "backup exceeds the {BACKUP_DOWNLOAD_CAP_BYTES}-byte download cap"
+            )));
+        }
+        std::fs::read(path).map_err(|e| AppError::Internal(format!("read backup: {e}")))
+    })();
+    // The temporary/live file is deleted even when the read failed — the
+    // body is fully constructed before the response exists, so removing
+    // the file here cannot truncate an in-flight download.
+    let _ = std::fs::remove_file(path);
+    result
+}
+
+/// Read a named (already-complete) backup from BACKUP_DIR, capped, without
+/// deleting it. Used by `GET /backup/download?path=<name>`.
+fn read_named_backup(dir: &std::path::Path, name: &str) -> Result<Vec<u8>, AppError> {
+    let canon = resolve_backup_file(dir, name)?;
+    let meta =
+        std::fs::metadata(&canon).map_err(|e| AppError::Internal(format!("stat backup: {e}")))?;
+    if !meta.is_file() {
+        return Err(AppError::BadRequest("not a regular file".to_string()));
+    }
+    if meta.len() > BACKUP_DOWNLOAD_CAP_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "backup exceeds the {BACKUP_DOWNLOAD_CAP_BYTES}-byte download cap"
+        )));
+    }
+    std::fs::read(&canon).map_err(|e| AppError::Internal(format!("read backup: {e}")))
+}
+
+fn backup_download_response(bytes: Vec<u8>, filename: String) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        axum::body::Body::from(bytes),
+    )
+        .into_response()
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes as f64 >= KB {
+        format!("{:.1} KB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// `.db` files in BACKUP_DIR (non-hidden, bare filenames), newest first,
+/// with name/size/mtime for the System page list.
+fn collect_backup_files(state: &AppState) -> Vec<BackupFileView> {
+    let mut files: Vec<(std::time::SystemTime, String, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&state.backup_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !name.ends_with(".db") {
+                continue;
+            }
+            if !valid_backup_filename(&name) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push((mtime, name, meta.len()));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    files
+        .into_iter()
+        .map(|(mtime, name, len)| BackupFileView {
+            name,
+            size_label: human_bytes(len),
+            mtime_label: fmt_ts_local(&time::OffsetDateTime::from(mtime)),
+        })
+        .collect()
+}
+
+/// True while a restore is pending — the in-memory flag for this process,
+/// or the durable `application_settings` row in the (restored) database,
+/// which is what re-arms the guard after a restart.
+async fn restore_pending_active(state: &AppState) -> bool {
+    if state.restore_pending.load(Ordering::Relaxed) {
+        return true;
+    }
+    matches!(
+        state.db.get_application_setting("restore_pending").await,
+        Ok(Some(v)) if crate::executor::restore_pending_value(&v)
+    )
+}
 
 fn utc_stamp() -> String {
     time::OffsetDateTime::now_utc()
@@ -1949,6 +2190,11 @@ async fn backup_restore(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| bak.display().to_string());
+    // In-memory guard for *this* process: the still-open connection points
+    // at the old inode, so visits would otherwise happily run against the
+    // stale database. The durable marker (application_settings in the
+    // restored file) re-arms the guard after a restart.
+    state.restore_pending.store(true, Ordering::Relaxed);
     tracing::warn!(bak = %bak.display(), "database restored from upload; restart required");
 
     if wants_htmx(&headers) {
@@ -1959,6 +2205,152 @@ async fn backup_restore(
         .into_response())
     } else {
         html(templates::render_ok(&RestoreDonePage { bak_name }))
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BackupDownloadQuery {
+    /// Bare filename of a file inside BACKUP_DIR; absent → stream a fresh
+    /// snapshot of the current database.
+    path: Option<String>,
+}
+
+/// `GET /backup/download` — streaming backup download.
+///
+/// Two modes, both streaming:
+/// * `?path` absent — a fresh snapshot of the *current* database via
+///   `VACUUM INTO` to `$BACKUP_DIR/.download-<ts>.db`; the temp copy is
+///   read into memory (64 MB cap), deleted, and streamed back with a
+///   `uptimepanda-backup-<ts>.db` attachment filename. The live DB file
+///   is never streamed mid-WAL.
+/// * `?path=<name>` — the named *completed* backup in BACKUP_DIR is
+///   streamed as-is (same 64 MB cap). Backups are `VACUUM INTO` outputs,
+///   i.e. consistent standalone files — safe to read without a copy.
+///
+/// The file is fully read into memory before the response is built, so a
+/// deleted temp file can never truncate an in-flight download.
+async fn backup_download(
+    State(state): State<SharedState>,
+    _session: Extension<SessionInfo>,
+    Query(query): Query<BackupDownloadQuery>,
+) -> Result<Response, AppError> {
+    std::fs::create_dir_all(&state.backup_dir)
+        .map_err(|e| AppError::Internal(format!("create backup dir: {e}")))?;
+    let stamp = utc_stamp();
+    match query.path.as_deref().map(str::trim) {
+        None | Some("") => {
+            let tmp = state.backup_dir.join(format!(".download-{stamp}.db"));
+            if let Err(e) = state.db.backup_to(&tmp).await {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            let bytes = read_and_remove(&tmp)?;
+            Ok(backup_download_response(
+                bytes,
+                format!("uptimepanda-backup-{stamp}.db"),
+            ))
+        }
+        Some(name) => {
+            if !valid_backup_filename(name) {
+                return Err(AppError::BadRequest(
+                    "invalid backup filename (expected ^[A-Za-z0-9._-]+$)".to_string(),
+                ));
+            }
+            let bytes = read_named_backup(&state.backup_dir, name)?;
+            Ok(backup_download_response(bytes, name.to_string()))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BackupPathQuery {
+    path: String,
+}
+
+/// `POST /backup/delete?path=<name>` — delete a named backup from
+/// BACKUP_DIR. Same filename validation as the download path; the file is
+/// the one just validated (no user-controlled traversal).
+async fn backup_delete(
+    State(state): State<SharedState>,
+    _session: Extension<SessionInfo>,
+    headers: HeaderMap,
+    Query(query): Query<BackupPathQuery>,
+    Form(_form): Form<CsrfOnlyForm>,
+) -> Result<Response, AppError> {
+    if !valid_backup_filename(&query.path) {
+        return Err(AppError::BadRequest(
+            "invalid backup filename (expected ^[A-Za-z0-9._-]+$)".to_string(),
+        ));
+    }
+    let canon = resolve_backup_file(&state.backup_dir, &query.path)?;
+    let meta =
+        std::fs::metadata(&canon).map_err(|e| AppError::Internal(format!("stat backup: {e}")))?;
+    if !meta.is_file() {
+        return Err(AppError::BadRequest("not a regular file".to_string()));
+    }
+    std::fs::remove_file(&canon).map_err(|e| AppError::Internal(format!("delete backup: {e}")))?;
+    tracing::info!(name = %query.path, "backup deleted");
+    Ok(backup_mutation_response(
+        &headers,
+        "ok",
+        format!("Backup {} deleted.", query.path),
+    ))
+}
+
+/// `POST /backup/restore/ack` — acknowledge a pending restore:
+/// clear the durable `restore_pending` row in the *live database file*
+/// and this process's in-memory flag. Visits run again immediately.
+///
+/// The durable write goes through a direct connection to
+/// `state.database_path`, not the pooled `Db`: after an in-process
+/// restore the pooled connection points at the old, renamed inode (the
+/// pre-restore database), so an upsert through it would never reach the
+/// restored file. After a restart both paths are the same file.
+async fn backup_restore_ack(
+    State(state): State<SharedState>,
+    _session: Extension<SessionInfo>,
+    headers: HeaderMap,
+    Form(_form): Form<CsrfOnlyForm>,
+) -> Result<Response, AppError> {
+    let path = state.database_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .map_err(|e| format!("open database for restore_pending ack: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("set busy_timeout: {e}"))?;
+        conn.execute(
+            "INSERT INTO application_settings (setting_key, setting_value, updated_at)
+             VALUES ('restore_pending', '0', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(setting_key) DO UPDATE SET
+                setting_value = '0',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            [],
+        )
+        .map_err(|e| format!("clear restore_pending: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("restore_pending ack task: {e}")))?
+    .map_err(AppError::Internal)?;
+    state.restore_pending.store(false, Ordering::Relaxed);
+    tracing::info!("restore_pending acknowledged; visits re-enabled");
+    Ok(backup_mutation_response(
+        &headers,
+        "ok",
+        "Restore acknowledged. Visits are re-enabled.".to_string(),
+    ))
+}
+
+/// Shared tail for the small backup POST actions: htmx → toast fragment;
+/// plain form → 303 back to /system.
+fn backup_mutation_response(headers: &HeaderMap, kind: &'static str, message: String) -> Response {
+    if wants_htmx(headers) {
+        Html(toast(kind, message)).into_response()
+    } else {
+        Redirect::to("/system").into_response()
     }
 }
 
@@ -2349,7 +2741,14 @@ mod tests {
         crate::config::seed_settings(&db)
             .await
             .expect("seed settings");
-        Arc::new(AppState::new(db, None, None, &config, "2026.11.09.1-alpha"))
+        Arc::new(AppState::new(
+            db,
+            None,
+            None,
+            &config,
+            "2026.11.09.1-alpha",
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ))
     }
 
     async fn file_db_state(dir: &std::path::Path) -> SharedState {
@@ -2358,7 +2757,14 @@ mod tests {
         crate::config::seed_settings(&db)
             .await
             .expect("seed settings");
-        Arc::new(AppState::new(db, None, None, &config, "2026.11.09.1-alpha"))
+        Arc::new(AppState::new(
+            db,
+            None,
+            None,
+            &config,
+            "2026.11.09.1-alpha",
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ))
     }
 
     use std::sync::Arc;
@@ -3853,6 +4259,527 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // --- SEG-16: streaming backup download / listing / restore ack ---
+
+    const KNOWN_BACKUP_NAME: &str = "uptimepanda-20990101-0000.db";
+
+    fn write_named_backup(backups: &std::path::Path, name: &str, bytes: &[u8], mtime_secs: u64) {
+        std::fs::create_dir_all(backups).expect("backups dir");
+        let path = backups.join(name);
+        std::fs::write(&path, bytes).expect("write backup");
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen backup");
+        let times = std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs),
+        );
+        file.set_times(times).expect("set mtime");
+    }
+
+    #[tokio::test]
+    async fn backup_download_absent_path_streams_fresh_snapshot_and_cleans_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+
+        let (status, headers, body) = request(
+            app.clone(),
+            "GET",
+            "/backup/download",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let cd = headers
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .expect("content-disposition present");
+        assert!(
+            cd.starts_with("attachment; filename=\"uptimepanda-backup-"),
+            "{cd}"
+        );
+        assert!(cd.ends_with(".db\""), "{cd}");
+        assert!(!body.is_empty(), "streamed snapshot is non-empty");
+        assert!(
+            body.starts_with(b"SQLite format 3\0"),
+            "snapshot is a real SQLite file"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("backups"))
+            .expect("backups dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".download-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "streaming temp copy must be deleted after the response is built"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_download_named_file_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let backups = dir.path().join("backups");
+        let payload = b"dummy-backup-bytes-for-roundtrip".to_vec();
+        write_named_backup(&backups, KNOWN_BACKUP_NAME, &payload, 1_800_000_000);
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+
+        let (status, headers, body) = request(
+            app,
+            "GET",
+            &format!("/backup/download?path={KNOWN_BACKUP_NAME}"),
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, payload, "downloaded bytes match the named backup");
+        let cd = headers
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .expect("content-disposition");
+        assert_eq!(format!("attachment; filename=\"{KNOWN_BACKUP_NAME}\""), cd);
+        // The named backup is NOT deleted — it is not a temp file.
+        assert!(backups.join(KNOWN_BACKUP_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn backup_download_rejects_bad_filenames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        for name in [
+            "../escape.db",
+            "%2e%2e/escape.db",
+            "sub%2fdir.db",
+            ".",
+            "..",
+            "evil!.db",
+            "-with%20space.db",
+            "missing.db",
+        ] {
+            let (status, _h, _b) = request(
+                app.clone(),
+                "GET",
+                &format!("/backup/download?path={name}"),
+                &[("cookie", cookie.as_str())],
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "path={name:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_download_requires_auth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let app = app(state);
+        let (status, headers, _b) =
+            request(app, "GET", "/backup/download", &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            headers.get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/login")
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_delete_removes_named_file_and_validates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let backups = dir.path().join("backups");
+        write_named_backup(&backups, KNOWN_BACKUP_NAME, b"payload", 1_800_000_000);
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+
+        // Invalid name → 400, file untouched.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/backup/delete?path=../escape.db",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(backups.join(KNOWN_BACKUP_NAME).exists());
+
+        // Valid delete → 303 redirect back to /system (plain form post).
+        let (status, headers, _b) = request(
+            app.clone(),
+            "POST",
+            &format!("/backup/delete?path={KNOWN_BACKUP_NAME}"),
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            headers.get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/system")
+        );
+        assert!(!backups.join(KNOWN_BACKUP_NAME).exists());
+
+        // Deleting a missing file → 400.
+        let (status, _h, _b) = request(
+            app,
+            "POST",
+            &format!("/backup/delete?path={KNOWN_BACKUP_NAME}"),
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn system_page_lists_backup_files_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let backups = dir.path().join("backups");
+        write_named_backup(
+            &backups,
+            "uptimepanda-20261101-0000.db",
+            b"older",
+            1_000_000_000,
+        );
+        write_named_backup(
+            &backups,
+            "uptimepanda-20261109-0000.db",
+            b"newer-backup",
+            1_800_000_000,
+        );
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        let (status, _h, body) = request(
+            app,
+            "GET",
+            "/system",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("system page utf-8");
+        let old_pos = text
+            .find("uptimepanda-20261101-0000.db")
+            .expect("old backup listed");
+        let new_pos = text
+            .find("uptimepanda-20261109-0000.db")
+            .expect("new backup listed");
+        assert!(new_pos < old_pos, "newest backup is listed first");
+        assert!(text.contains("/backup/download?path=uptimepanda-20261109-0000.db"));
+        assert!(text.contains("/backup/delete?path=uptimepanda-20261109-0000.db"));
+        // Restore banner absent when no restore is pending.
+        assert!(!text.contains("RESTORE PENDING"));
+    }
+
+    #[tokio::test]
+    async fn restore_pending_restore_then_banner_then_ack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = file_db_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+
+        // 1) Create a real backup.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/backup",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let backup_path = std::fs::read_dir(dir.path().join("backups"))
+            .expect("backups dir")
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".db"))
+            .expect("backup file")
+            .path();
+        let backup_bytes = std::fs::read(&backup_path).expect("backup bytes");
+
+        // 2) Garbage upload → 400, flag stays clear.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/backup/restore",
+            &[
+                ("cookie", cookie.as_str()),
+                ("x-csrf-token", csrf.as_str()),
+                ("content-type", "application/octet-stream"),
+            ],
+            Body::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !state
+                .restore_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // 3) Valid upload → 200, flag set, banner rendered.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/backup/restore",
+            &[
+                ("cookie", cookie.as_str()),
+                ("x-csrf-token", csrf.as_str()),
+                ("content-type", "application/octet-stream"),
+            ],
+            Body::from(backup_bytes),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            state
+                .restore_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // The durable marker lives in the restored (now-live) file.
+        let setting = rusqlite::Connection::open(dir.path().join("uptimepanda.db"))
+            .expect("open restored db")
+            .query_row(
+                "SELECT setting_value FROM application_settings WHERE setting_key = 'restore_pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("restore_pending row present in restored file");
+        assert_eq!(setting, "1");
+
+        let (status, _h, body) = request(
+            app.clone(),
+            "GET",
+            "/system",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("system utf-8");
+        assert!(text.contains("RESTORE PENDING"), "banner rendered: {text}");
+
+        // 4) Ack → 200, flag cleared, durable row is '0', banner gone.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/backup/restore/ack",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(
+            !state
+                .restore_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let setting = rusqlite::Connection::open(dir.path().join("uptimepanda.db"))
+            .expect("open restored db")
+            .query_row(
+                "SELECT setting_value FROM application_settings WHERE setting_key = 'restore_pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("restore_pending row present after ack");
+        assert_eq!(setting, "0");
+
+        let (status, _h, body) = request(
+            app,
+            "GET",
+            "/system",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("system utf-8");
+        assert!(!text.contains("RESTORE PENDING"), "banner cleared: {text}");
+    }
+
+    #[tokio::test]
+    async fn history_outcome_filter_returns_only_matching_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+
+        // Seed one website and six visits, one per outcome.
+        let now = time::OffsetDateTime::now_utc();
+        let website = crate::db::Website {
+            id: 0,
+            name: "filter-seed".to_string(),
+            url: "https://filter-seed.example.com/".to_string(),
+            enabled: true,
+            profile_id: None,
+            monitoring_mode: crate::db::MonitoringMode::Basic,
+            min_interval_seconds: 10,
+            max_interval_seconds: 20,
+            min_session_seconds: 5,
+            max_session_seconds: 10,
+            last_visit_at: None,
+            next_visit_at: None,
+            created_at: now,
+            updated_at: now,
+            active_window_start: None,
+            active_window_end: None,
+            timezone: None,
+        };
+        let website_id = state
+            .db
+            .insert_website(&website)
+            .await
+            .expect("insert website");
+        for (i, outcome) in [
+            Outcome::Success,
+            Outcome::Timeout,
+            Outcome::NavigationError,
+            Outcome::BrowserCrash,
+            Outcome::InteractionError,
+            Outcome::Timeout,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let visit = crate::db::VisitHistoryRow {
+                id: 0,
+                website_id,
+                profile_id: None,
+                started_at: now - time::Duration::minutes((i as i64) + 1),
+                completed_at: Some(now - time::Duration::minutes(i as i64)),
+                duration_ms: Some(1_000 + i as i64),
+                http_status: Some(200),
+                final_url: Some("https://filter-seed.example.com/".to_string()),
+                outcome,
+                error_message: None,
+                browser_pid: Some(1234),
+                memory_usage: Some(1),
+            };
+            state.db.record_visit(&visit).await.expect("record visit");
+        }
+
+        let (status, _h, body) = request(
+            app.clone(),
+            "GET",
+            "/history?outcome=timeout",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("history utf-8");
+        assert_eq!(text.matches("pill warn\">timeout</span>").count(), 2);
+        assert!(!text.contains("pill ok\">success</span>"));
+        assert!(!text.contains("pill warn\">navigation_error</span>"));
+        assert!(!text.contains("pill err\">browser_crash</span>"));
+        assert!(!text.contains("pill err\">interaction_error</span>"));
+
+        // Unknown outcome value falls back to "all" rows.
+        let (status, _h, body) = request(
+            app.clone(),
+            "GET",
+            "/history?outcome=bogus",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("history utf-8");
+        assert!(text.contains("pill ok\">success</span>"));
+
+        // Pagination beyond range clamps to the last page (single page).
+        let (status, _h, body) = request(
+            app,
+            "GET",
+            "/history?page=999",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("history utf-8");
+        assert!(text.contains("Page 1 of 1"), "page clamped: {text}");
+    }
+
+    #[tokio::test]
+    async fn history_empty_filter_shows_empty_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        let (status, _h, body) = request(
+            app,
+            "GET",
+            "/history?outcome=browser_crash",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("history utf-8");
+        assert!(
+            text.contains("No visits recorded yet"),
+            "empty-state: {text}"
+        );
+    }
+
+    #[test]
+    fn clamp_page_bounds() {
+        assert_eq!(clamp_page(None, 0, 20), (1, 1));
+        assert_eq!(clamp_page(Some(1), 0, 20), (1, 1));
+        assert_eq!(clamp_page(Some(5), 0, 20), (1, 1));
+        assert_eq!(clamp_page(None, 1, 20), (1, 1));
+        assert_eq!(clamp_page(Some(1), 40, 20), (1, 2));
+        assert_eq!(clamp_page(Some(2), 40, 20), (2, 2));
+        assert_eq!(
+            clamp_page(Some(3), 40, 20),
+            (2, 2),
+            "beyond range clamps to last"
+        );
+        assert_eq!(
+            clamp_page(Some(0), 40, 20),
+            (1, 2),
+            "below range clamps to first"
+        );
+        assert_eq!(clamp_page(Some(-1), 40, 20), (1, 2));
+        assert_eq!(clamp_page(Some(2), 41, 20), (2, 3));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 //! Values are plain data; askama escapes everything by default.
 
 use askama::Template;
+use time::OffsetDateTime;
 
 use crate::browser::sessions::USER_AGENT_PRESETS;
 use crate::db::models::Outcome;
@@ -46,6 +47,18 @@ pub struct OverviewStats {
 pub struct OverviewPage {
     pub chrome: LayoutChrome,
     pub stats: OverviewStats,
+    /// Next five scheduled visits, earliest first. Empty-state rendered
+    /// by the template when this is empty.
+    pub upcoming: Vec<UpcomingVisitView>,
+}
+
+/// One row of the overview "Upcoming visits" table.
+pub struct UpcomingVisitView {
+    pub website_name: String,
+    pub profile_name: String,
+    /// `fmt_ts_local` + relative suffix, e.g. `2026-11-09 15:04:05 UTC`.
+    pub next_visit_label: String,
+    pub time_until_label: String,
 }
 
 #[derive(Template)]
@@ -228,6 +241,51 @@ pub struct OutcomeOptionView {
     pub label: &'static str,
 }
 
+/// One chip on the browser-events table filter on the System page.
+pub struct EventTypeOptionView {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// The six event types the System page offers as filter chips. `all` is
+/// handled implicitly (no `event_type` query param).
+pub const EVENT_TYPE_OPTIONS: [EventTypeOptionView; 6] = [
+    EventTypeOptionView {
+        value: "restarting",
+        label: "restarting",
+    },
+    EventTypeOptionView {
+        value: "restarted",
+        label: "restarted",
+    },
+    EventTypeOptionView {
+        value: "crashed",
+        label: "crashed",
+    },
+    EventTypeOptionView {
+        value: "health_warn",
+        label: "health_warn",
+    },
+    EventTypeOptionView {
+        value: "db_size_warn",
+        label: "db_size_warn",
+    },
+    EventTypeOptionView {
+        value: "app_memory_high",
+        label: "app_memory_high",
+    },
+];
+
+/// Type guard for the `event_type` query param: only the six known
+/// values are honoured; anything else falls back to "all".
+pub fn normalize_event_type(raw: Option<&str>) -> Option<&'static str> {
+    let raw = raw?.trim();
+    EVENT_TYPE_OPTIONS
+        .iter()
+        .find(|o| o.value == raw)
+        .map(|o| o.value)
+}
+
 pub const OUTCOME_OPTIONS: [OutcomeOptionView; 5] = [
     OutcomeOptionView {
         value: "success",
@@ -257,6 +315,14 @@ pub struct WebsiteOptionView {
     pub name: String,
 }
 
+/// One filter chip on the history page (outcomes) — precomputed href so
+/// the template never string-builds URLs.
+pub struct ChipView {
+    pub label: String,
+    pub href: String,
+    pub active: bool,
+}
+
 #[derive(Clone)]
 pub struct HistoryRowView {
     pub started_label: String,
@@ -274,8 +340,10 @@ pub struct HistoryRowView {
 pub struct HistoryPage {
     pub chrome: LayoutChrome,
     pub websites: Vec<WebsiteOptionView>,
-    pub outcomes: &'static [OutcomeOptionView],
     pub selected_website: i64,
+    /// Outcome filter chips (value `all` first), hrefs precomputed so each
+    /// preserves the current `website_id`.
+    pub outcome_chips: Vec<ChipView>,
     pub selected_outcome: String,
     pub total: i64,
     pub page: i64,
@@ -307,6 +375,21 @@ pub struct BrowserEventView {
     pub details: String,
 }
 
+/// One `.db` file in BACKUP_DIR, for the System page backup list.
+pub struct BackupFileView {
+    /// Bare filename — validated by the caller; rendered escaped.
+    pub name: String,
+    pub size_label: String,
+    pub mtime_label: String,
+}
+
+/// One chip on the browser-events `event_type` filter — href precomputed.
+pub struct EventTypeChipView {
+    pub label: &'static str,
+    pub href: String,
+    pub active: bool,
+}
+
 #[derive(Template)]
 #[template(path = "system.html")]
 pub struct SystemPage {
@@ -314,6 +397,15 @@ pub struct SystemPage {
     pub browser_available: bool,
     pub events: Vec<BrowserEventView>,
     pub stats: SystemStatsView,
+    /// Listed `.db` files in BACKUP_DIR, newest first.
+    pub backups: Vec<BackupFileView>,
+    /// Render the restore-pending banner (flag or `application_settings`
+    /// row — whichever says a restore is pending).
+    pub restore_pending: bool,
+    /// Currently selected `event_type` filter (`""` = all).
+    pub event_type: String,
+    /// Event-type filter chips (the six known types), hrefs precomputed.
+    pub event_type_chips: Vec<EventTypeChipView>,
 }
 
 pub struct SystemStatsView {
@@ -427,5 +519,109 @@ pub fn outcome_class(outcome: Outcome) -> &'static str {
         Outcome::Success => "ok",
         Outcome::Timeout | Outcome::NavigationError => "warn",
         Outcome::BrowserCrash | Outcome::InteractionError => "err",
+    }
+}
+
+/// Relative suffix for a future timestamp: `"in 45s"`, `"in 12m"`,
+/// `"in 3h"`, `"in 2d"`. Present or past timestamps render as `"due"`.
+pub fn time_until(t: &OffsetDateTime) -> String {
+    time_until_at(t, OffsetDateTime::now_utc())
+}
+
+/// Deterministic core of [`time_until`] — `now` is injected so tests can
+/// pin the boundary values exactly.
+pub(crate) fn time_until_at(t: &OffsetDateTime, now: OffsetDateTime) -> String {
+    let secs = (*t - now).whole_seconds();
+    if secs <= 0 {
+        return "due".to_string();
+    }
+    if secs < 60 {
+        format!("in {secs}s")
+    } else if secs < 3_600 {
+        format!("in {}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("in {}h", secs / 3_600)
+    } else {
+        format!("in {}d", secs / 86_400)
+    }
+}
+
+/// Table timestamp with an explicit UTC suffix (`2026-11-09 15:04:05 UTC`).
+/// Mirrors the `Started (UTC)` column convention used by the history table.
+pub fn fmt_ts_local(t: &OffsetDateTime) -> String {
+    format!("{} UTC", crate::web::templates::ts(t))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_until_renders_due_and_units() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("epoch");
+        let at = |secs: i64| now + time::Duration::seconds(secs);
+        assert_eq!(time_until_at(&now, now), "due");
+        assert_eq!(
+            time_until_at(&(now - time::Duration::seconds(1)), now),
+            "due"
+        );
+        assert_eq!(time_until_at(&at(1), now), "in 1s");
+        assert_eq!(time_until_at(&at(45), now), "in 45s");
+        assert_eq!(time_until_at(&at(59), now), "in 59s");
+        assert_eq!(time_until_at(&at(60), now), "in 1m");
+        assert_eq!(time_until_at(&at(719), now), "in 11m");
+        assert_eq!(time_until_at(&at(720), now), "in 12m");
+        assert_eq!(time_until_at(&at(3_599), now), "in 59m");
+        assert_eq!(time_until_at(&at(3_600), now), "in 1h");
+        assert_eq!(time_until_at(&at(3 * 3_600), now), "in 3h");
+        assert_eq!(time_until_at(&at(86_399), now), "in 23h");
+        assert_eq!(time_until_at(&at(86_400), now), "in 1d");
+        assert_eq!(time_until_at(&at(2 * 86_400), now), "in 2d");
+    }
+
+    #[test]
+    fn time_until_matches_documented_samples() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("epoch");
+        let at = |secs: i64| now + time::Duration::seconds(secs);
+        assert_eq!(time_until_at(&at(45), now), "in 45s");
+        assert_eq!(time_until_at(&at(12 * 60), now), "in 12m");
+        assert_eq!(time_until_at(&at(3 * 3_600), now), "in 3h");
+    }
+
+    #[test]
+    fn time_until_public_wrapper_does_not_panic_in_the_past() {
+        let past = OffsetDateTime::from_unix_timestamp(1_000_000_000).expect("epoch");
+        assert_eq!(time_until(&past), "due");
+    }
+
+    #[test]
+    fn fmt_ts_local_appends_utc_suffix() {
+        let t = OffsetDateTime::from_unix_timestamp(1_800_000_000).expect("epoch");
+        let out = fmt_ts_local(&t);
+        assert!(out.ends_with(" UTC"), "suffix present: {out}");
+        assert!(out.len() > 5, "timestamp body present: {out}");
+    }
+
+    #[test]
+    fn normalize_event_type_accepts_only_known_values() {
+        assert_eq!(normalize_event_type(None), None);
+        assert_eq!(normalize_event_type(Some("")), None);
+        assert_eq!(normalize_event_type(Some("bogus")), None);
+        assert_eq!(normalize_event_type(Some("CRASHED")), None);
+        assert_eq!(normalize_event_type(Some(" crashed")), Some("crashed"));
+        for known in [
+            "restarting",
+            "restarted",
+            "crashed",
+            "health_warn",
+            "db_size_warn",
+            "app_memory_high",
+        ] {
+            assert_eq!(normalize_event_type(Some(known)), Some(known));
+        }
     }
 }

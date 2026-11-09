@@ -3,11 +3,15 @@
 //!
 //! One `execute()` call performs exactly one visit:
 //!
-//!  0. **pre-flight memory guard** — when `MemAvailable` (`/proc/meminfo`)
-//!     is below [`crate::resources::RESOURCE_GUARD_MIN_AVAILABLE_MB`] the
-//!     visit is refused *before* the gate is taken: no `visit_history` row
-//!     is written, no browser work starts. The caller maps the refusal to a
-//!     retryable `timeout` scheduler completion (the scheduler owns backoff);
+//!  0. **pre-flight guards** — refused *before* the gate is taken: no
+//!     `visit_history` row is written, no browser work starts. (a) the
+//!     **memory guard** — when `MemAvailable` (`/proc/meminfo`) is below
+//!     [`crate::resources::RESOURCE_GUARD_MIN_AVAILABLE_MB`]; (b) the
+//!     **restore-pending guard** — when a database restore was activated
+//!     in this process (`AppState.restore_pending`) or the live
+//!     `application_settings.restore_pending` row says one is pending.
+//!     The refusal is mapped by the caller to a retryable `timeout`
+//!     scheduler completion (the scheduler owns backoff);
 //!  1. loads the website (unknown id → `NavigationError` outcome, nothing
 //!     recorded — `visit_history.website_id` is a foreign key);
 //!  2. loads the browser profile when `websites.profile_id` is set. A profile
@@ -17,7 +21,7 @@
 //!  3. acquires the manager's `visit_gate` for the **entire** visit — before
 //!     `ensure_running()` — so a recycle can never SIGTERM the browser
 //!     mid-visit. Released on every return path because the guard is bound
-//!     in `execute`'s scope; (with one exception: a pre-flight memory-guard
+//!     in `execute`'s scope; (with one exception: a pre-flight guard
 //!     refusal returns `Err` *before* the gate is taken — nothing else is
 //!     touched);
 //!  4. ensures Lightpanda is running (`ensure_running`, ≤30 s). Failure →
@@ -68,6 +72,7 @@
 //! [`security::redact_message`] before logging or recording.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
@@ -114,7 +119,7 @@ impl std::fmt::Display for ExecutorError {
         match self {
             ExecutorError::ResourceGuard => write!(
                 f,
-                "insufficient available memory (MemAvailable < {} MB)",
+                "pre-flight guard refused the visit (MemAvailable < {} MB or a database restore is pending)",
                 crate::resources::RESOURCE_GUARD_MIN_AVAILABLE_MB
             ),
         }
@@ -148,6 +153,9 @@ pub struct Executor {
     /// contract; the DB-backed settings are the live control plane.
     #[allow(dead_code)]
     config: Arc<Config>,
+    /// Shared with `AppState` — set by the restore handler. See
+    /// [`restore_pending_flag`].
+    restore_pending: Arc<AtomicBool>,
 }
 
 /// Map the executor's outcome onto the outcome the scheduler consumes.
@@ -225,6 +233,39 @@ pub(crate) fn js_truthy(v: &serde_json::Value) -> bool {
     }
 }
 
+/// Comparison used by the restore-pending guard: only the literals `"1"`
+/// and `"true"` (case-insensitive, surrounding whitespace ignored) count
+/// as pending. Everything else — including an absent or unreadable value
+/// — is not pending.
+pub(crate) fn restore_pending_value(v: &str) -> bool {
+    let v = v.trim();
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
+/// Free-function wrapper around the in-memory flag, kept separate so the
+/// semantics (Relaxed load — the flag is a hint, not a lock) are unit-tested
+/// exactly once.
+pub(crate) fn restore_pending_flag(flag: &AtomicBool) -> bool {
+    flag.load(Ordering::Relaxed)
+}
+
+/// Raw read of `application_settings.restore_pending` — see
+/// [`restore_pending_value`]. A read error is treated as "not pending"
+/// (fail-open): the database is unreadable anyway, and visits then fail
+/// on the website-load path where the outcome is recorded. The fail-closed
+/// window (this process swapped the live file under the open connection) is
+/// covered by the in-memory flag instead.
+pub(crate) async fn restore_pending_setting(db: &Db) -> bool {
+    match db.get_application_setting("restore_pending").await {
+        Ok(Some(v)) => restore_pending_value(&v),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(error = %e, "restore_pending setting unreadable; treating as not pending");
+            false
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal flow types
 // ---------------------------------------------------------------------------
@@ -259,30 +300,40 @@ impl Executor {
         manager: Arc<BrowserManager>,
         encryption_key: String,
         config: Arc<Config>,
+        restore_pending: Arc<AtomicBool>,
     ) -> Self {
         Self {
             db,
             manager,
             encryption_key,
             config,
+            restore_pending,
         }
     }
 
     /// Execute one visit. Never panics on the normal path.
     ///
-    /// Returns `Err(ExecutorError::ResourceGuard)` when `MemAvailable` is
-    /// below the pre-flight floor — before the gate is taken, before any
-    /// browser work, before `visit_history` is touched. Every other failure
-    /// mode is a recorded `Outcome` (unknown-website, which FK-prevents a
-    /// row, excepted).
+    /// Returns `Err(ExecutorError::ResourceGuard)` when a pre-flight guard
+    /// refuses the visit — `MemAvailable` below the floor, or a database
+    /// restore is pending (in-memory flag or durable `application_settings`
+    /// row) — before the gate is taken, before any browser work, before
+    /// `visit_history` is touched. Every other failure mode is a recorded
+    /// `Outcome` (unknown-website, which FK-prevents a row, excepted).
     pub async fn execute(
         &self,
         website_id: i64,
         trigger: ExecutionTrigger,
     ) -> Result<VisitOutcome, ExecutorError> {
-        // 0) Pre-flight memory guard — BEFORE the gate, before any work.
+        // 0) Pre-flight guards — BEFORE the gate, before any work.
         //    A refusal leaves no trace in `visit_history` by design; the
         //    caller maps it to a retryable timeout completion.
+        if restore_pending_flag(&self.restore_pending) || restore_pending_setting(&self.db).await {
+            tracing::warn!(
+                website_id,
+                "visit refused: database restore pending (restart required)"
+            );
+            return Err(ExecutorError::ResourceGuard);
+        }
         if let Some(avail) = crate::resources::mem_available_mb()
             && crate::resources::should_refuse(avail)
         {
@@ -1135,6 +1186,10 @@ mod tests {
     use crate::db::BrowserProfile;
     use crate::db::models::MonitoringMode;
 
+    fn no_restore_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     fn sample_website(id: i64, min_session: i64, max_session: i64) -> Website {
         let now = OffsetDateTime::now_utc();
         Website {
@@ -1238,6 +1293,82 @@ mod tests {
         }
     }
 
+    // --- restore-pending guard ---
+
+    #[test]
+    fn restore_pending_value_compares_literals() {
+        assert!(restore_pending_value("1"));
+        assert!(restore_pending_value("true"));
+        assert!(restore_pending_value("TRUE"));
+        assert!(restore_pending_value("True"));
+        assert!(restore_pending_value("  true  "));
+        assert!(restore_pending_value(" 1 "));
+        assert!(!restore_pending_value("0"));
+        assert!(!restore_pending_value("false"));
+        assert!(!restore_pending_value(""));
+        assert!(!restore_pending_value("yes"));
+        assert!(!restore_pending_value("2"));
+        assert!(!restore_pending_value("on"));
+    }
+
+    #[test]
+    fn restore_pending_flag_reads_atomic_bool() {
+        let flag = AtomicBool::new(false);
+        assert!(!restore_pending_flag(&flag));
+        flag.store(true, Ordering::Relaxed);
+        assert!(restore_pending_flag(&flag));
+        flag.store(false, Ordering::Relaxed);
+        assert!(!restore_pending_flag(&flag));
+    }
+
+    #[tokio::test]
+    async fn restore_pending_setting_reads_setting_row() {
+        let db = Db::in_memory().await.expect("db");
+        // Absent key → not pending.
+        assert!(!restore_pending_setting(&db).await);
+        // "0" → not pending.
+        db.upsert_application_setting("restore_pending", "0")
+            .await
+            .expect("upsert 0");
+        assert!(!restore_pending_setting(&db).await);
+        // "1" → pending.
+        db.upsert_application_setting("restore_pending", "1")
+            .await
+            .expect("upsert 1");
+        assert!(restore_pending_setting(&db).await);
+        // "true" → pending.
+        db.upsert_application_setting("restore_pending", "true")
+            .await
+            .expect("upsert true");
+        assert!(restore_pending_setting(&db).await);
+    }
+
+    #[tokio::test]
+    async fn restore_pending_flag_refuses_visit_before_any_work() {
+        let db = Db::in_memory().await.expect("db");
+        let id = insert_site(&db, "https://guarded.example.com/", 1, 1, None).await;
+        // `launch` does not spawn anything (spawn_monitoring is what
+        // boots the browser); the manager is required by the constructor
+        // but must never be asked to start in this test.
+        let manager = Arc::new(BrowserManager::launch(db.clone(), "lightpanda", 19_977).await);
+        let flag = Arc::new(AtomicBool::new(true));
+        let executor = Executor::new(
+            db.clone(),
+            manager,
+            "flag-gate-key-0000".to_string(),
+            test_config("flag-gate-key-0000"),
+            Arc::clone(&flag),
+        );
+        let err = executor
+            .execute(id, ExecutionTrigger::Scheduled)
+            .await
+            .expect_err("restore-pending flag must refuse the visit");
+        assert_eq!(err, ExecutorError::ResourceGuard);
+        // Nothing was recorded: no history row, no status change.
+        let rows = db.recent_visits(10, None).await.expect("visits");
+        assert!(rows.is_empty(), "no visit_history row on refusal");
+    }
+
     // --- live tests (require lightpanda + network) ---
 
     fn lightpanda_available() -> bool {
@@ -1295,6 +1426,7 @@ mod tests {
             manager.clone(),
             key.to_string(),
             test_config(key),
+            no_restore_flag(),
         );
         let outcome = executor
             .execute(id, ExecutionTrigger::Scheduled)
@@ -1370,6 +1502,7 @@ mod tests {
             manager.clone(),
             key.to_string(),
             test_config(key),
+            no_restore_flag(),
         );
         let outcome = executor
             .execute(id, ExecutionTrigger::Scheduled)
@@ -1443,6 +1576,7 @@ mod tests {
             manager.clone(),
             key.to_string(),
             test_config(key),
+            no_restore_flag(),
         );
         let outcome = executor
             .execute(job.website_id, ExecutionTrigger::Manual)

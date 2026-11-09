@@ -116,6 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Panics in a visit are converted into `interaction_error` completions —
     // they never take down the worker or the HTTP listener.
     let mut scheduler_handle: Option<scheduler::SchedulerHandle> = None;
+    // Shared between the executor's pre-flight guard and AppState (set by
+    // the restore handler). One flag, two readers.
+    let restore_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Some(mgr) = &manager {
         let (tx, rx) = tokio::sync::mpsc::channel::<scheduler::VisitJob>(1);
         // Deployment-default timezone comes from Config.tz (TZ env, UTC fallback).
@@ -125,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::sync::Arc::clone(mgr),
             config.encryption_key.clone(),
             std::sync::Arc::clone(&config),
+            std::sync::Arc::clone(&restore_pending),
         ));
         let sched_for_loop = sched.clone();
         tokio::spawn(async move {
@@ -162,14 +166,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "failed to report scheduler completion");
                         }
                     }
-                    // Pre-flight memory guard refused the visit before any
-                    // work started. Map to a retryable `timeout` completion
-                    // (the scheduler owns backoff); no `visit_history` row
-                    // exists, which is the point.
+                    // Pre-flight restore-pending / memory guard refused
+                    // the visit before any work started. Map to a
+                    // retryable `timeout` completion (the scheduler owns
+                    // backoff); no `visit_history` row exists, which is
+                    // the point. Note: the scheduler stays alive but
+                    // every visit refuses while a restore is pending,
+                    // bounded by the retry backoff/claim cadence.
                     Ok(Err(executor::ExecutorError::ResourceGuard)) => {
                         tracing::warn!(
                             website_id,
-                            "visit refused by memory guard; reporting timeout for scheduler backoff"
+                            "visit refused by pre-flight guard; reporting timeout for scheduler backoff"
                         );
                         if let Err(e) = sched_for_loop
                             .handle_completion(website_id, db::Outcome::Timeout)
@@ -243,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduler_handle.clone(),
         &config,
         VERSION.trim(),
+        std::sync::Arc::clone(&restore_pending),
     ));
 
     let app = web::routes::build_router(app_state);
