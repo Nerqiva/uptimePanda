@@ -24,3 +24,6 @@ backup-*.db
 UPTIMEPANDA_PLAN.md
 
 
+
+# Smoke-test artifacts
+cookies.txt
