@@ -68,6 +68,19 @@ fn scheduler_state(website_id: i64) -> SchedulerState {
     }
 }
 
+fn sample_interaction_sequence(website_id: i64, enabled: bool) -> InteractionSequence {
+    let ts = now();
+    InteractionSequence {
+        id: 0,
+        website_id,
+        enabled,
+        configuration_json:
+            r#"{"actions":[{"type":"wait_duration","ms":1000}],"on_error":"abort"}"#.to_string(),
+        created_at: ts,
+        updated_at: ts,
+    }
+}
+
 /// Count rows matching a fixture-owned `where_clause` (integer literals
 /// only — never user input).
 async fn raw_count(db: &Db, table: &str, where_clause: &str) -> i64 {
@@ -267,17 +280,9 @@ async fn fk_cascade_from_website_delete() {
         .await
         .expect("upsert scheduler state");
 
-    // interaction_sequences has no write helper yet — seed it raw.
-    db.connection()
-        .call(move |c| {
-            c.execute(
-                "INSERT INTO interaction_sequences (website_id) VALUES (?1)",
-                params![website_id],
-            )?;
-            Ok::<_, rusqlite::Error>(())
-        })
+    db.upsert_interaction_sequence(&sample_interaction_sequence(website_id, true))
         .await
-        .expect("seed interaction sequence");
+        .expect("upsert interaction sequence");
 
     assert_eq!(
         raw_count(&db, "visit_history", &format!("website_id = {website_id}")).await,
@@ -888,4 +893,104 @@ async fn insert_default_state(db: &Db, website_id: i64) {
     db.upsert_scheduler_state(&scheduler_state(website_id))
         .await
         .expect("state");
+}
+
+// --- interaction_sequences --------------------------------------------------
+
+#[tokio::test]
+async fn interaction_sequence_upsert_get_round_trip() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let website_id = db
+        .insert_website(&sample_website("iseq"))
+        .await
+        .expect("insert website");
+
+    // Missing initially.
+    assert!(
+        db.get_interaction_sequence(website_id)
+            .await
+            .expect("get missing")
+            .is_none()
+    );
+
+    let seq = sample_interaction_sequence(website_id, true);
+    let id = db.upsert_interaction_sequence(&seq).await.expect("upsert");
+    assert!(id > 0);
+
+    let loaded = db
+        .get_interaction_sequence(website_id)
+        .await
+        .expect("get")
+        .expect("row exists");
+    assert_eq!(loaded.website_id, website_id);
+    assert!(loaded.enabled);
+    assert_eq!(loaded.configuration_json, seq.configuration_json);
+}
+
+#[tokio::test]
+async fn interaction_sequence_upsert_replaces_existing_row() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let website_id = db
+        .insert_website(&sample_website("iseq-replace"))
+        .await
+        .expect("insert website");
+
+    let first = db
+        .upsert_interaction_sequence(&sample_interaction_sequence(website_id, true))
+        .await
+        .expect("first upsert");
+
+    let mut updated = sample_interaction_sequence(website_id, false);
+    updated.configuration_json = r#"{"actions":[],"on_error":"continue"}"#.to_string();
+    let second = db
+        .upsert_interaction_sequence(&updated)
+        .await
+        .expect("second upsert");
+
+    assert_eq!(first, second, "upsert must keep the same row id");
+    let loaded = db
+        .get_interaction_sequence(website_id)
+        .await
+        .expect("get")
+        .expect("row exists");
+    assert!(!loaded.enabled);
+    assert_eq!(loaded.configuration_json, updated.configuration_json);
+    assert_eq!(
+        raw_count(
+            &db,
+            "interaction_sequences",
+            &format!("website_id = {website_id}")
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn interaction_sequence_delete() {
+    let db = Db::in_memory().await.expect("open in-memory db");
+    let website_id = db
+        .insert_website(&sample_website("iseq-delete"))
+        .await
+        .expect("insert website");
+
+    db.upsert_interaction_sequence(&sample_interaction_sequence(website_id, true))
+        .await
+        .expect("upsert");
+    assert!(
+        db.delete_interaction_sequence(website_id)
+            .await
+            .expect("delete")
+    );
+    assert!(
+        !db.delete_interaction_sequence(website_id)
+            .await
+            .expect("second delete returns false")
+    );
+    assert!(
+        db.get_interaction_sequence(website_id)
+            .await
+            .expect("get after delete")
+            .is_none()
+    );
 }

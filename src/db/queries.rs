@@ -100,6 +100,17 @@ fn visit_history_from_row(row: &Row<'_>) -> rusqlite::Result<VisitHistoryRow> {
     })
 }
 
+fn interaction_sequence_from_row(row: &Row<'_>) -> rusqlite::Result<InteractionSequence> {
+    Ok(InteractionSequence {
+        id: row.get("id")?,
+        website_id: row.get("website_id")?,
+        enabled: row.get("enabled")?,
+        configuration_json: row.get("configuration_json")?,
+        created_at: parse_db_ts(&row.get::<_, String>("created_at")?, 4)?,
+        updated_at: parse_db_ts(&row.get::<_, String>("updated_at")?, 5)?,
+    })
+}
+
 const WEBSITE_COLUMNS: &str = "id, name, url, enabled, profile_id, monitoring_mode, \
      min_interval_seconds, max_interval_seconds, min_session_seconds, max_session_seconds, \
      last_visit_at, next_visit_at, created_at, updated_at, \
@@ -113,6 +124,9 @@ const COOKIE_COLUMNS: &str = "id, profile_id, domain, encrypted_cookie_data, \
 
 const VISIT_HISTORY_COLUMNS: &str = "id, website_id, profile_id, started_at, completed_at, \
      duration_ms, http_status, final_url, outcome, error_message, browser_pid, memory_usage";
+
+const INTERACTION_SEQUENCE_COLUMNS: &str = "id, website_id, enabled, configuration_json, \
+     created_at, updated_at";
 
 impl Db {
     /// All websites with `enabled = 1`, ordered by creation.
@@ -245,6 +259,73 @@ impl Db {
             .connection()
             .call(move |c| -> rusqlite::Result<usize> {
                 c.execute("DELETE FROM websites WHERE id = ?1", params![id])
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Fetch the interaction sequence configured for `website_id`, if any.
+    pub async fn get_interaction_sequence(
+        &self,
+        website_id: i64,
+    ) -> Result<Option<InteractionSequence>> {
+        let row = self
+            .connection()
+            .call(move |c| {
+                c.query_row(
+                    &format!(
+                        "SELECT {INTERACTION_SEQUENCE_COLUMNS} FROM interaction_sequences WHERE website_id = ?1"
+                    ),
+                    params![website_id],
+                    interaction_sequence_from_row,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// Insert or replace the interaction sequence for `website_id` (there is
+    /// at most one per website). `updated_at` is always set to now.
+    /// The `id` on the input is ignored; returns the row id.
+    pub async fn upsert_interaction_sequence(&self, sequence: &InteractionSequence) -> Result<i64> {
+        let sequence = sequence.clone();
+        let updated_at = format_db_ts(OffsetDateTime::now_utc())?;
+        let id = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "INSERT INTO interaction_sequences
+                        (website_id, enabled, configuration_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(website_id) DO UPDATE SET
+                        enabled = excluded.enabled,
+                        configuration_json = excluded.configuration_json,
+                        updated_at = excluded.updated_at
+                     RETURNING id",
+                    params![
+                        sequence.website_id,
+                        sequence.enabled,
+                        sequence.configuration_json,
+                        updated_at,
+                    ],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        Ok(id)
+    }
+
+    /// Delete the interaction sequence for `website_id`.
+    /// Returns `true` when a row was actually deleted.
+    pub async fn delete_interaction_sequence(&self, website_id: i64) -> Result<bool> {
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "DELETE FROM interaction_sequences WHERE website_id = ?1",
+                    params![website_id],
+                )
             })
             .await?;
         Ok(affected > 0)
