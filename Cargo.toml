@@ -1,6 +1,6 @@
 [package]
 name = "uptimepanda"
-version = "2026.11.9-alpha.6" # SemVer projection of CalVer 2026.11.09.5-alpha (Cargo requires SemVer)
+version = "2026.11.9-alpha.7" # SemVer projection of CalVer 2026.11.09.5-alpha (Cargo requires SemVer)
 edition = "2024"
 license = "Apache-2.0"
 
