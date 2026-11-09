@@ -32,11 +32,14 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5.8"
 
 [profile.release]
-# debug = false, lto = "thin", codegen-units = 1: keep release builds lean and
-# optimized without binary-size heroics; the binding constraint is RAM, not bytes.
+# debug = false: keep release builds lean; the binding constraint is RAM, not bytes.
+# lto = false, codegen-units = 16: the multi-arch CI image build runs the arm64
+# Rust release build under QEMU emulation — thin LTO with a single codegen unit
+# exceeds the 30-minute job window. Relaxed codegen costs the app nothing (it
+# is not CPU-bound) and buys back parallelism on all platforms.
 debug = false
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
 
 [dev-dependencies]
 tempfile = "3.27.0"
