@@ -1,0 +1,11 @@
+.git
+target
+data
+*.md
+tests
+UPTIMEPANDA_PLAN.md
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+docs/phase0-validation.md

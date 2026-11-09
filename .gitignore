@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Local runtime data (SQLite, WAL/SHM journals, backups)
+/data/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+backups/
+backup-*.db
+
+# Environment / secrets
+.env
+
+# Logs
+*.log
+
+# Implementation plan (local working document, never committed)
+UPTIMEPANDA_PLAN.md
