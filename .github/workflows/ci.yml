@@ -59,14 +59,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compute CalVer alpha tag
+      # Image tag = the VERSION file (single source of truth). Counting
+      # tags independently of the release workflow made the image tag drift
+      # by one bump; VERSION parity guarantees image == release.
+      - name: Read image tag from VERSION
         id: calver
         run: |
           set -eu
-          DATE=$(date -u +%Y.%m.%d)
-          COUNT=$(git tag -l "v${DATE}.*" | wc -l | tr -d ' ')
-          CALVER="${DATE}.$((COUNT+1))-alpha"
-          echo "calver=$CALVER" >> "$GITHUB_OUTPUT"
+          echo "calver=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Lowercase repository name
         run: echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
