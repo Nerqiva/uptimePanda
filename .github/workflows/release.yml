@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute CalVer alpha version
+        id: calver
+        run: |
+          set -euo pipefail
+          # Skip automated version-bump commits to avoid re-releasing.
+          MSG="$(git log -1 --pretty=%s)"
+          if echo "$MSG" | grep -qE '^chore\(release\):'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: latest commit is an automated release bump ($MSG)"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          DATE="$(date -u +%Y.%m.%d)"
+          # Count existing tags for today's date to build the per-day counter.
+          COUNT="$(git tag -l "v${DATE}.*" | wc -l | tr -d ' ')"
+          NEXT=$((COUNT + 1))
+          VERSION="${DATE}.${NEXT}-alpha"
+          TAG="v${VERSION}"
+          # SemVer projection for Cargo.toml (Cargo requires SemVer):
+          # strip leading zeros from month/day via arithmetic expansion.
+          IFS='.' read -r Y M D <<< "$DATE"
+          PROJECTION="${Y}.$((10#$M)).$((10#$D))-alpha.${NEXT}"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "projection=${PROJECTION}" >> "$GITHUB_OUTPUT"
+          echo "Computed version: ${VERSION} (tag ${TAG}, Cargo projection ${PROJECTION})"
+
+      - name: Sync version into VERSION, Cargo.toml, Cargo.lock, README.md
+        if: steps.calver.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.calver.outputs.version }}
+          PROJECTION: ${{ steps.calver.outputs.projection }}
+          DATE: ${{ steps.calver.outputs.date }}
+          TAG: ${{ steps.calver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # 1. VERSION file
+          echo "$VERSION" > VERSION
+          # 2. Cargo.toml [package] version — SemVer projection.
+          #    Replace ONLY the first line starting with `version = "`
+          #    (dependencies use inline tables like `{ version = ...`, never ^version).
+          awk -v proj="$PROJECTION" '
+            BEGIN { done = 0 }
+            /^version = "/ && !done {
+              sub(/"[^"]*"/, "\"" proj "\"")
+              done = 1
+            }
+            { print }
+          ' Cargo.toml > Cargo.toml.tmp
+          mv Cargo.toml.tmp Cargo.toml
+          echo "Cargo.toml [package] version line now:"
+          grep -m1 -E '^version = "' Cargo.toml
+          # 3. Cargo.lock root package entry (`name = "uptimepanda"` followed by
+          #    `version = "..."` in the same [[package]] block).
+          sed -i -E '/^name = "uptimepanda"$/{n;s/^version = ".*"$/version = "'"$PROJECTION"'"/}' Cargo.lock
+          echo "Cargo.lock root entry now:"
+          grep -A1 'name = "uptimepanda"' Cargo.lock | grep '^version = '
+          # 4. README.md version block (SEG-20 creates the file; tolerate absence).
+          if [ -f README.md ]; then
+            python3 - <<'PYEOF'
+          import os
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          date = os.environ["DATE"]
+          tag = os.environ["TAG"]
+
+          with open("README.md", "r", newline="") as fh:
+              content = fh.read()
+          nl = "\r\n" if "\r\n" in content else "\n"
+          block = (
+              "<!-- version:start -->" + nl
+              + "**Version:** " + version + " ([changelog](../blob/main/CHANGELOG.md)) — released " + date
+              + " · [prerelease " + tag + "](https://github.com/Nerqiva/uptimePanda/releases/tag/" + tag + ")" + nl
+              + "<!-- version:end -->"
+          )
+          pattern = re.compile(r"<!-- version:start -->.*?<!-- version:end -->", re.DOTALL)
+          match = pattern.search(content)
+          if match is None:
+              sys.exit("error: README.md is missing the <!-- version:start --> / <!-- version:end --> markers")
+          updated = content[: match.start()] + block + content[match.end():]
+          with open("README.md", "w", newline="") as fh:
+              fh.write(updated)
+          print("README.md version block synced.")
+          PYEOF
+          else
+            echo "README.md not present yet; skipping version sync (SEG-20 creates it)"
+          fi
+
+      - name: Sanity-check version sync
+        if: steps.calver.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.calver.outputs.version }}
+          PROJECTION: ${{ steps.calver.outputs.projection }}
+        run: |
+          set -euo pipefail
+          FAIL=0
+          if ! grep -qF "$VERSION" VERSION; then
+            echo "error: VERSION does not contain '$VERSION'"
+            FAIL=1
+          fi
+          if ! grep -qF "$PROJECTION" Cargo.toml; then
+            echo "error: Cargo.toml does not contain projection '$PROJECTION'"
+            FAIL=1
+          fi
+          if ! grep -A1 'name = "uptimepanda"' Cargo.lock | grep -qF "$PROJECTION"; then
+            echo "error: Cargo.lock root entry does not contain projection '$PROJECTION'"
+            FAIL=1
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "Version sync sanity check failed"
+            exit 1
+          fi
+          echo "Sanity check passed: VERSION=$VERSION projection=$PROJECTION"
+
+      - name: Commit version bump
+        if: steps.calver.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add VERSION Cargo.toml Cargo.lock README.md 2>/dev/null || git add VERSION Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "No version changes to commit; skipping push"
+          else
+            git commit -m "chore(release): ${VERSION} [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Create prerelease
+        if: steps.calver.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.calver.outputs.version }}
+          TAG: ${{ steps.calver.outputs.tag }}
+          DATE: ${{ steps.calver.outputs.date }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/release-notes.md <<EOF
+          Automated **alpha** prerelease.
+
+          - Version: \`${VERSION}\`
+          - CalVer date: \`${DATE}\`
+          - Stability: \`alpha\`
+          - Commit: \`$(git rev-parse HEAD)\`
+          EOF
+          gh release create "$TAG" \
+            --target "$(git rev-parse HEAD)" \
+            --title "$VERSION" \
+            --prerelease \
+            --notes-file /tmp/release-notes.md

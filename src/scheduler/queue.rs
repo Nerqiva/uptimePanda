@@ -793,6 +793,8 @@ impl SchedulerHandle {
                 .await?;
             if let Some(t) = next {
                 let mut core = self.shared.core.lock().expect("core mutex poisoned");
+                core.heap
+                    .retain(|e| !(e.trigger == Trigger::Scheduled && e.key.0.2 == website_id));
                 push_entry(&mut core, website_id, t, Trigger::Scheduled);
             }
         }
@@ -877,9 +879,19 @@ impl SchedulerHandle {
         };
         self.db.upsert_scheduler_state(&state).await?;
 
-        if let Some(t) = next_visit_at {
+        {
             let mut core = self.shared.core.lock().expect("core mutex poisoned");
-            push_entry(&mut core, website_id, t, Trigger::Scheduled);
+            // The heap is a wake-up structure over the DB source of truth:
+            // drop any stale Scheduled entries for this website first, so a
+            // long-running monitor never accumulates one dead entry per
+            // completed visit (the DB carries the real next_visit_at).
+            core.heap
+                .retain(|e| !(e.trigger == Trigger::Scheduled && e.key.0.2 == website_id));
+            if let Some(t) = next_visit_at {
+                push_entry(&mut core, website_id, t, Trigger::Scheduled);
+            } else {
+                core.scheduled_in_heap.remove(&website_id);
+            }
         }
         self.shared.notify.notify_one();
         Ok(())
@@ -1241,6 +1253,42 @@ mod tests {
             "min == max interval, got {delta}"
         );
         assert_eq!(handle.queue_length(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_completions_do_not_accumulate_heap_entries() {
+        // Regression: each completion used to push a fresh Scheduled entry
+        // without dropping the stale one, so the heap grew by one entry per
+        // completed visit. The DB is the source of truth; the heap must
+        // hold at most one Scheduled entry per website.
+        let db = Db::in_memory().await.expect("db");
+        let id = insert_site(&db, &sample_website("pileup", 300, 300, true)).await;
+        insert_state(&db, id, None, JobStatus::Pending, 0).await;
+        let (handle, mut rx) = start(&db);
+        recv_job(&mut rx).await; // boot claim
+        for round in 1..=4 {
+            handle
+                .handle_completion(id, Outcome::Success)
+                .await
+                .expect("completion");
+            assert_eq!(
+                handle.queue_length(),
+                1,
+                "scheduled after completion {round}"
+            );
+            let ack = handle.enqueue_manual(id).await.expect("enqueue");
+            assert!(matches!(ack, EnqueueAck::Queued { .. }), "round {round}");
+            recv_job(&mut rx).await;
+            handle
+                .handle_completion(id, Outcome::Success)
+                .await
+                .expect("manual completion");
+            assert_eq!(
+                handle.queue_length(),
+                1,
+                "scheduled after manual completion {round}"
+            );
+        }
     }
 
     #[tokio::test]
