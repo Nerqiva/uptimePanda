@@ -3,7 +3,7 @@
 Rust + Lightpanda lightweight synthetic website monitoring for 512 MB RAM / 0.15 vCPU.
 
 <!-- version:start -->
-**Version:** 2026.11.09.7-alpha ([changelog](CHANGELOG.md)) — released 2026.11.09 · [prerelease v2026.11.09.7-alpha](https://github.com/Nerqiva/uptimePanda/releases/tag/v2026.11.09.7-alpha)
+**Version:** 2026.11.09.8-alpha ([changelog](CHANGELOG.md)) — released 2026.11.09 · [prerelease v2026.11.09.8-alpha](https://github.com/Nerqiva/uptimePanda/releases/tag/v2026.11.09.8-alpha)
 <!-- version:end -->
 
 > [!IMPORTANT]
