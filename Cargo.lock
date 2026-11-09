@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "uptimepanda"
-version = "2026.11.9-alpha.1"
+version = "2026.11.9-alpha.2"
 dependencies = [
  "aes-gcm",
  "askama",
