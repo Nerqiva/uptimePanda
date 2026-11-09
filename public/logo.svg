@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 64" role="img" aria-label="uptime panda">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#242d40"/>
+      <stop offset="1" stop-color="#1c2333"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#tile)" stroke="#2e3a52" stroke-width="2"/>
+  <circle cx="17.5" cy="19" r="7" fill="#0b0f1a"/>
+  <circle cx="46.5" cy="19" r="7" fill="#0b0f1a"/>
+  <circle cx="32" cy="36" r="17.5" fill="#34d399"/>
+  <circle cx="25" cy="34" r="2.6" fill="#0b0f1a"/>
+  <circle cx="39" cy="34" r="2.6" fill="#0b0f1a"/>
+  <ellipse cx="32" cy="44.5" rx="3.1" ry="2.2" fill="#0b0f1a"/>
+  <text x="74" y="40" font-family="'JetBrains Mono',ui-monospace,monospace" font-weight="600" font-size="23" letter-spacing="0.5"><tspan fill="#cdd6f4">uptime</tspan><tspan fill="#34d399">·</tspan><tspan fill="#cdd6f4">panda</tspan></text>
+</svg>
