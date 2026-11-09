@@ -1,7 +1,8 @@
 [package]
 name = "uptimepanda"
-version = "2026.11.9-alpha.5" # SemVer projection of CalVer 2026.11.09.1-alpha (Cargo requires SemVer; projection is monotonic with the CalVer ordering)
+version = "2026.11.9-alpha.5" # SemVer projection of CalVer 2026.11.09.5-alpha (Cargo requires SemVer)
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 aes-gcm = "0.11.1"

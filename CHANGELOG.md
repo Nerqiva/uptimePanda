@@ -27,6 +27,11 @@ Everything below is implemented on `main` and verified locally
 (fmt → clippy → test → release build), but has not shipped as a versioned
 release yet.
 
+### Changed
+
+- **License** — declared **Apache-2.0** (`LICENSE` file, `Cargo.toml` `license` field, README
+  license section).
+
 ### Added
 
 - **Dashboard** — server-rendered HTMX + Askama UI on a dark-navy design

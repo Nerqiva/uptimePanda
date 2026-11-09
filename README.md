@@ -631,7 +631,5 @@ docker pull ghcr.io/nerqiva/uptimepanda:latest
 
 ## License
 
-License: not specified. No `LICENSE` file exists in this repository and the
-crate metadata carries no license field — all rights reserved by default. If
-you need to use this code under a specific license, open an issue asking for
-one to be chosen.
+Licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for the full text.
+You may use, reproduce and distribute this software under the terms of that license.
