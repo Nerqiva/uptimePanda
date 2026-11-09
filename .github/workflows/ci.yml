@@ -11,7 +11,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Let multi-arch image builds run to completion instead of cancelling
+  # them on the next push; superseded-but-green pushes are wasteful but safe.
+  cancel-in-progress: false
 
 jobs:
   test:
