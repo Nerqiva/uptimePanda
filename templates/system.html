@@ -1,0 +1,95 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card">
+  <div class="chiprow">
+    <span class="chip">v{{ chrome.version }}</span>
+    <a class="chip" href="/api/system">/api/system (raw JSON)</a>
+    {% if !browser_available %}<span class="pill err">lightpanda unavailable</span>{% endif %}
+  </div>
+  <div id="system-stats" hx-get="/fragments/system" hx-trigger="load, every 3s" hx-swap="innerHTML">
+    {% include "partials/system_stats.html" %}
+  </div>
+  <div class="log-actions">
+    <form method="post" action="/system/restart" hx-post="/system/restart" hx-swap="none">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <button class="btn" type="submit" data-confirm="Restart the Lightpanda browser now?|Restart">Restart browser</button>
+    </form>
+    <form method="post" action="/backup" hx-post="/backup" hx-swap="none">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <button class="btn" type="submit">Back up database</button>
+    </form>
+  </div>
+  <p class="muted">Backups are written to the server-local <code>BACKUP_DIR</code> via <code>VACUUM INTO</code>. The backup file is not streamed over HTTP here — it stays on disk; streaming download lands in SEG-16.</p>
+</div>
+
+<div class="card">
+  <h2 class="section-title">Restore database</h2>
+  <p class="muted">Upload a previously created <code>uptimepanda-*.db</code>. The file is validated (SQLite header + integrity_check) before anything is swapped, and the active database is kept as <code>.db.bak-&lt;ts&gt;</code>. A restart of the process is required afterwards.</p>
+  <form id="restore-form">
+    <div class="field">
+      <span>Backup file (.db)</span>
+      <input type="file" id="restore-file" accept=".db,application/octet-stream" required>
+    </div>
+    <div class="btn-row">
+      <button type="button" class="btn danger" id="restore-submit">Restore backup</button>
+      <span class="muted">Sends the raw file as application/octet-stream (≤ 64 MB).</span>
+    </div>
+  </form>
+  <div id="restore-result" class="note" role="status"></div>
+</div>
+
+<div class="card">
+  <h2 class="section-title">Recent browser events</h2>
+  {% if events.is_empty() %}
+  <p class="muted">No browser events recorded yet.</p>
+  {% else %}
+  <table class="table">
+    <thead>
+      <tr><th>Time (UTC)</th><th>Event</th><th>Memory</th><th>Details</th></tr>
+    </thead>
+    <tbody>
+      {% for ev in events %}
+      <tr>
+        <td class="muted">{{ ev.timestamp_label }}</td>
+        <td><span class="pill{% if ev.warn %} warn{% endif %}">{{ ev.event_type }}</span></td>
+        <td>{{ ev.memory_label }}</td>
+        <td class="muted table-error">{{ ev.details }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+<script>
+(function () {
+  "use strict";
+  var submit = document.getElementById("restore-submit");
+  var fileInput = document.getElementById("restore-file");
+  var result = document.getElementById("restore-result");
+  submit.addEventListener("click", function () {
+    var file = fileInput.files && fileInput.files[0];
+    if (!file) { result.textContent = "Choose a backup file first."; result.className = "note err"; return; }
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    var headers = { "content-type": "application/octet-stream" };
+    if (meta && meta.content) headers["x-csrf-token"] = meta.content;
+    result.textContent = "Uploading…";
+    result.className = "note";
+    fetch("/backup/restore", { method: "POST", headers: headers, body: file })
+      .then(function (res) { return res.text().then(function (body) { return { status: res.status, body: body }; }); })
+      .then(function (out) {
+        if (out.status === 200) {
+          result.className = "note";
+          result.innerHTML = out.body;
+        } else {
+          result.className = "note err";
+          result.textContent = "Restore failed (" + out.status + ")";
+        }
+      })
+      .catch(function () {
+        result.className = "note err";
+        result.textContent = "Restore failed: network error";
+      });
+  });
+})();
+</script>
+{% endblock %}

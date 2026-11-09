@@ -1121,3 +1121,344 @@ impl Db {
         Ok(affected as u64)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Overview / history / system aggregates (SEG-11)
+// ---------------------------------------------------------------------------
+
+/// One row of the history table: the visit joined with the website name and
+/// the profile name (LEFT JOIN — profile may be NULL).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryEntry {
+    pub visit: VisitHistoryRow,
+    pub website_name: String,
+    pub profile_name: Option<String>,
+}
+
+/// One row of the websites table: the website joined with its profile name
+/// and (LEFT JOIN) its scheduler row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebsiteListEntry {
+    pub website: Website,
+    pub profile_name: Option<String>,
+    pub job_status: Option<JobStatus>,
+    pub next_visit_at: Option<OffsetDateTime>,
+}
+
+impl Db {
+    /// Total number of websites.
+    pub async fn count_websites(&self) -> Result<i64> {
+        let n = self
+            .connection()
+            .call(|c| -> rusqlite::Result<i64> {
+                c.query_row("SELECT COUNT(*) FROM websites", [], |row| row.get(0))
+            })
+            .await?;
+        Ok(n)
+    }
+
+    /// Number of websites with `enabled = 1`.
+    pub async fn count_enabled_websites(&self) -> Result<i64> {
+        let n = self
+            .connection()
+            .call(|c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM websites WHERE enabled = 1",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        Ok(n)
+    }
+
+    /// Websites that are enabled and not paused. A website with no
+    /// scheduler_state row yet counts as active (freshly added monitor).
+    pub async fn count_active_websites(&self) -> Result<i64> {
+        let n = self
+            .connection()
+            .call(|c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM websites w
+                     LEFT JOIN scheduler_state s ON s.website_id = w.id
+                     WHERE w.enabled = 1
+                       AND (s.job_status IS NULL OR s.job_status != 'paused')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        Ok(n)
+    }
+
+    /// Visits recorded since `since`.
+    pub async fn count_visits_since(&self, since: OffsetDateTime) -> Result<i64> {
+        let since = format_db_ts(since)?;
+        let n = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM visit_history WHERE started_at >= ?1",
+                    params![since],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        Ok(n)
+    }
+
+    /// Outcome histogram since `since`.
+    pub async fn outcome_counts_since(&self, since: OffsetDateTime) -> Result<Vec<(Outcome, i64)>> {
+        let since = format_db_ts(since)?;
+        let rows = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Vec<(Outcome, i64)>> {
+                let mut stmt = c.prepare(
+                    "SELECT outcome, COUNT(*) FROM visit_history
+                     WHERE started_at >= ?1 GROUP BY outcome",
+                )?;
+                let rows = stmt
+                    .query_map(params![since], |row| {
+                        Ok((
+                            Outcome::from_db_str(0, &row.get::<_, String>(0)?)?,
+                            row.get::<_, i64>(1)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Earliest scheduled visit among pending/retry jobs.
+    pub async fn next_scheduled_visit_at(&self) -> Result<Option<OffsetDateTime>> {
+        let row = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Option<String>> {
+                c.query_row(
+                    "SELECT MIN(next_visit_at) FROM scheduler_state
+                     WHERE job_status IN ('pending', 'retry')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        row.map(|s| parse_db_ts(&s, 0))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Newest `browser_events` rows (newest first), `limit` clamped to 0..=500.
+    pub async fn recent_browser_events(&self, limit: i64) -> Result<Vec<BrowserEvent>> {
+        let limit = limit.clamp(0, 500);
+        let rows = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Vec<BrowserEvent>> {
+                let mut stmt = c.prepare(
+                    "SELECT id, event_type, timestamp, memory_usage, details
+                     FROM browser_events ORDER BY id DESC LIMIT ?1",
+                )?;
+                let rows = stmt
+                    .query_map(params![limit], |row| {
+                        Ok(BrowserEvent {
+                            id: row.get(0)?,
+                            event_type: row.get(1)?,
+                            timestamp: parse_db_ts(&row.get::<_, String>(2)?, 2)?,
+                            memory_usage: row.get(3)?,
+                            details: row.get(4)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Cookie row count per profile: `(profile_id, count)`.
+    pub async fn cookie_counts(&self) -> Result<Vec<(i64, i64)>> {
+        let rows = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<(i64, i64)>> {
+                let mut stmt =
+                    c.prepare("SELECT profile_id, COUNT(*) FROM cookies GROUP BY profile_id")?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Earliest cookie expiry per profile (`NULL` min when the fixture has
+    /// only session cookies): `(profile_id, min_expires_at)`.
+    pub async fn cookie_earliest_expiry(&self) -> Result<Vec<(i64, Option<OffsetDateTime>)>> {
+        let rows = self
+            .connection()
+            .call(
+                |c| -> rusqlite::Result<Vec<(i64, Option<OffsetDateTime>)>> {
+                    let mut stmt = c.prepare(
+                        "SELECT profile_id, MIN(expires_at) FROM cookies GROUP BY profile_id",
+                    )?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((row.get(0)?, parse_db_ts_opt(row.get(1)?, 1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(rows)
+                },
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    /// `(profile_id, website name)` pairs for every website bound to a
+    /// profile, ordered by profile then name.
+    pub async fn profile_website_assignments(&self) -> Result<Vec<(i64, String)>> {
+        let rows = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<(i64, String)>> {
+                let mut stmt = c.prepare(
+                    "SELECT profile_id, name FROM websites
+                     WHERE profile_id IS NOT NULL ORDER BY profile_id, name",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Websites joined with profile name + scheduler state, id order.
+    pub async fn list_websites_with_state(&self) -> Result<Vec<WebsiteListEntry>> {
+        let rows = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<WebsiteListEntry>> {
+                let mut stmt = c.prepare(
+                    "SELECT w.id, w.name, w.url, w.enabled, w.profile_id, w.monitoring_mode,
+                            w.min_interval_seconds, w.max_interval_seconds,
+                            w.min_session_seconds, w.max_session_seconds,
+                            w.last_visit_at, w.next_visit_at, w.created_at, w.updated_at,
+                            w.active_window_start, w.active_window_end, w.timezone,
+                            p.name AS profile_name,
+                            s.job_status AS state_status, s.next_visit_at AS state_next_visit_at
+                     FROM websites w
+                     LEFT JOIN browser_profiles p ON p.id = w.profile_id
+                     LEFT JOIN scheduler_state s ON s.website_id = w.id
+                     ORDER BY w.id",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let website = Website {
+                            id: row.get("id")?,
+                            name: row.get("name")?,
+                            url: row.get("url")?,
+                            enabled: row.get("enabled")?,
+                            profile_id: row.get("profile_id")?,
+                            monitoring_mode: MonitoringMode::from_db_str(
+                                5,
+                                &row.get::<_, String>("monitoring_mode")?,
+                            )?,
+                            min_interval_seconds: row.get("min_interval_seconds")?,
+                            max_interval_seconds: row.get("max_interval_seconds")?,
+                            min_session_seconds: row.get("min_session_seconds")?,
+                            max_session_seconds: row.get("max_session_seconds")?,
+                            last_visit_at: parse_db_ts_opt(row.get("last_visit_at")?, 10)?,
+                            next_visit_at: parse_db_ts_opt(row.get("next_visit_at")?, 11)?,
+                            created_at: parse_db_ts(&row.get::<_, String>("created_at")?, 12)?,
+                            updated_at: parse_db_ts(&row.get::<_, String>("updated_at")?, 13)?,
+                            active_window_start: row.get("active_window_start")?,
+                            active_window_end: row.get("active_window_end")?,
+                            timezone: row.get("timezone")?,
+                        };
+                        let job_status = row
+                            .get::<_, Option<String>>("state_status")?
+                            .map(|s| JobStatus::from_db_str(24, &s))
+                            .transpose()?;
+                        let state_next = row
+                            .get::<_, Option<String>>("state_next_visit_at")?
+                            .map(|s| parse_db_ts(&s, 25))
+                            .transpose()?;
+                        Ok(WebsiteListEntry {
+                            website,
+                            profile_name: row.get("profile_name")?,
+                            job_status,
+                            next_visit_at: state_next,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// History page query: visits filtered by website and outcome, newest
+    /// first, with the website and profile names joined in.
+    pub async fn history_page(
+        &self,
+        website_id: Option<i64>,
+        outcome: Option<Outcome>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<HistoryEntry>> {
+        let outcome = outcome.map(|o| o.as_str().to_string());
+        let offset = offset.max(0);
+        let limit = limit.clamp(1, 500);
+        let rows = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Vec<HistoryEntry>> {
+                let mut stmt = c.prepare(
+                    "SELECT v.id, v.website_id, v.profile_id, v.started_at, v.completed_at,
+                            v.duration_ms, v.http_status, v.final_url, v.outcome,
+                            v.error_message, v.browser_pid, v.memory_usage,
+                            w.name AS website_name, p.name AS profile_name
+                     FROM visit_history v
+                     JOIN websites w ON w.id = v.website_id
+                     LEFT JOIN browser_profiles p ON p.id = v.profile_id
+                     WHERE (?1 IS NULL OR v.website_id = ?1)
+                       AND (?2 IS NULL OR v.outcome = ?2)
+                     ORDER BY v.started_at DESC, v.id DESC
+                     LIMIT ?3 OFFSET ?4",
+                )?;
+                let rows = stmt
+                    .query_map(params![website_id, outcome, limit, offset], |row| {
+                        Ok(HistoryEntry {
+                            visit: visit_history_from_row(row)?,
+                            website_name: row.get("website_name")?,
+                            profile_name: row.get("profile_name")?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Total visit count matching the history filters (for pagination).
+    pub async fn count_history(
+        &self,
+        website_id: Option<i64>,
+        outcome: Option<Outcome>,
+    ) -> Result<i64> {
+        let outcome = outcome.map(|o| o.as_str().to_string());
+        let n = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM visit_history
+                     WHERE (?1 IS NULL OR website_id = ?1)
+                       AND (?2 IS NULL OR outcome = ?2)",
+                    params![website_id, outcome],
+                    |row| row.get(0),
+                )
+            })
+            .await?;
+        Ok(n)
+    }
+}

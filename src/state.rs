@@ -1,2 +1,62 @@
-// TODO(SEG-11): Shared application state (bounded channels, cloned handles).
-// See UPTIMEPANDA_PLAN.md SEG-11.
+//! Shared application state (SEG-11).
+//!
+//! Hoisted once in `main` and handed to the router. Cheap to clone via
+//! [`SharedState`] (every field is cheap to clone or behind `Arc`).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::browser::manager::BrowserManager;
+use crate::config::Config;
+use crate::db::Db;
+use crate::scheduler::SchedulerHandle;
+
+/// Application state shared with every handler.
+pub struct AppState {
+    pub db: Db,
+    /// `None` when the Lightpanda binary is absent — handlers must not
+    /// assume a browser is up.
+    pub manager: Option<Arc<BrowserManager>>,
+    /// `None` when no browser is available (scheduler not started).
+    pub scheduler: Option<SchedulerHandle>,
+    /// Held for the SEG-13 wiring (e.g. cookie operations reseeding keys);
+    /// the executor currently carries its own copy from `Config`.
+    #[allow(dead_code)]
+    pub encryption_key: String,
+    /// Dashboard login password, held for constant-time verification.
+    pub app_password: String,
+    /// `sha256(app_password || ":" || encryption_key)` — session/CSRF key.
+    pub session_key: [u8; 32],
+    pub database_path: PathBuf,
+    pub backup_dir: PathBuf,
+    pub version: &'static str,
+}
+
+pub type SharedState = Arc<AppState>;
+
+impl AppState {
+    pub fn new(
+        db: Db,
+        manager: Option<Arc<BrowserManager>>,
+        scheduler: Option<SchedulerHandle>,
+        config: &Config,
+        version: &'static str,
+    ) -> Self {
+        use sha2::Digest as _;
+        let session_key: [u8; 32] = sha2::Sha256::digest(
+            format!("{}:{}", config.app_password, config.encryption_key).as_bytes(),
+        )
+        .into();
+        Self {
+            db,
+            manager,
+            scheduler,
+            encryption_key: config.encryption_key.clone(),
+            app_password: config.app_password.clone(),
+            session_key,
+            database_path: config.database_path.clone(),
+            backup_dir: config.backup_dir.clone(),
+            version,
+        }
+    }
+}

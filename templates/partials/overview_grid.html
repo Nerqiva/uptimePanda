@@ -1,0 +1,47 @@
+<div class="stat-grid" id="overview-stats">
+  <div class="stat-card">
+    <span class="stat-label">Websites</span>
+    <span class="stat-value">{{ stats.websites_total }}</span>
+    <span class="stat-sub">{{ stats.websites_enabled }} enabled</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Active monitors</span>
+    <span class="stat-value">{{ stats.active }}</span>
+    <span class="stat-sub">enabled &amp; not paused</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Visits 24h</span>
+    <span class="stat-value">{{ stats.visits_24h }}</span>
+    <span class="stat-sub">all outcomes</span>
+  </div>
+  <div class="stat-card ok">
+    <span class="stat-label">Success 24h</span>
+    <span class="stat-value">{{ stats.success_24h }}</span>
+    <span class="stat-sub">outcome = success</span>
+  </div>
+  <div class="stat-card{% if stats.fail_24h > 0 %} err{% endif %}">
+    <span class="stat-label">Failures 24h</span>
+    <span class="stat-value">{{ stats.fail_24h }}</span>
+    <span class="stat-sub">everything non-success</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Success rate 24h</span>
+    <span class="stat-value">{{ stats.success_rate }}</span>
+    <span class="stat-sub">share of successful visits</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Browser</span>
+    <span class="stat-value">{% if stats.browser_running %}up{% else %}down{% endif %}</span>
+    <span class="stat-sub">{{ stats.browser_sub }}</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Browser RSS</span>
+    <span class="stat-value">{{ stats.browser_rss_mb }}</span>
+    <span class="stat-sub">MB / {{ stats.mem_restart_mb }} MB restart · warn {{ stats.mem_warn_mb }}</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Next visit</span>
+    <span class="stat-value">{{ stats.next_visit }}</span>
+    <span class="stat-sub">queue length {{ stats.queue_len }}</span>
+  </div>
+</div>

@@ -1,0 +1,105 @@
+{% extends "layout.html" %}
+{% block content %}
+<p><a href="/websites">← Websites</a> · <span class="muted">{{ website_name }}</span></p>
+<div class="card">
+  <div class="chiprow">
+    <span class="pill{% if enabled %} ok{% endif %}">{{ mode_label }}</span>
+    <span class="chip">{{ action_count }} action(s)</span>
+  </div>
+  <p class="muted">Save-time validation is enforced server-side; the textarea is never trusted. Empty sequence (<code>{"actions": []}</code>) = basic mode.</p>
+  {% set oob = false %}
+  {% include "partials/interaction_errors.html" %}
+  <form method="post" action="/websites/{{ website_id }}/interactions" hx-post="/websites/{{ website_id }}/interactions" hx-swap="none" id="interaction-form">
+    <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+    <div class="field">
+      <span>Sequence JSON</span>
+      <textarea id="interaction-json" name="configuration_json" spellcheck="false">{{ sequence_json }}</textarea>
+    </div>
+    <label class="check"><input type="checkbox" name="enabled" value="on"{% if enabled %} checked{% endif %}> Sequence enabled (uncheck to keep basic mode without deleting the draft)</label>
+    <div class="btn-row">
+      <button type="submit" class="btn primary">Save</button>
+      <button type="button" class="btn ghost" id="interaction-format">Format JSON</button>
+      <button type="button" class="btn ghost" data-modal-open="interaction-clear-modal">Clear sequence</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2 class="section-title">Insert action</h2>
+  <p class="muted">Buttons append a validated-shape snippet to the textarea. Reorder or edit fields by hand; the server re-validates on save.</p>
+  <div class="btn-row" id="interaction-palette">
+    <button type="button" class="btn small" data-snippet="navigate">navigate</button>
+    <button type="button" class="btn small" data-snippet="wait_duration">wait_duration</button>
+    <button type="button" class="btn small" data-snippet="wait_selector">wait_selector</button>
+    <button type="button" class="btn small" data-snippet="wait_js">wait_js</button>
+    <button type="button" class="btn small" data-snippet="scroll">scroll</button>
+    <button type="button" class="btn small" data-snippet="click">click</button>
+    <button type="button" class="btn small" data-snippet="end_session">end_session</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2 class="section-title">Validator rules (enforced on save)</h2>
+  <ul class="muted">
+    <li>CSS selectors ≤ 200 chars, no <code>javascript:</code> anywhere.</li>
+    <li>Click selectors may not reference pay/purchase/checkout/buy/order/delete/remove/confirm/submit/unsubscribe/account/login/password/card/wire/transfer patterns.</li>
+    <li>Sequence ≤ {{ limits.max_actions }} actions; rotation branches count fully.</li>
+    <li>Total conservative time budget ≤ {{ limits.total_budget_s }} s; each click wait ≤ {{ limits.max_click_wait_ms }} ms; scroll operations ≤ {{ limits.max_scroll_ops }} per action.</li>
+    <li><code>navigate</code> targets must be absolute http(s) URLs, same origin as the website.</li>
+    <li><code>end_session</code> may appear at most once and only last. No form submission, no arbitrary clicking, no uploads — ever.</li>
+  </ul>
+</div>
+
+<div class="modal-overlay" id="interaction-clear-modal" hidden role="dialog" aria-modal="true" aria-label="Clear interaction sequence">
+  <div class="modal-card">
+    <h2 class="modal-title">Clear interaction sequence?</h2>
+    <p class="muted">Deletes the stored sequence; the monitor falls back to basic mode.</p>
+    <div class="modal-actions">
+      <form method="post" action="/websites/{{ website_id }}/interactions/clear" hx-post="/websites/{{ website_id }}/interactions/clear" hx-swap="none">
+        <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+        <button class="btn danger solid" type="submit">Clear sequence</button>
+      </form>
+      <button type="button" class="btn ghost" data-modal-close>Cancel</button>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var SNIPPETS = {
+    navigate: { type: "navigate", url: "https://example.com/" },
+    wait_duration: { type: "wait_duration", ms: 1500, jitter_pct: 20 },
+    wait_selector: { type: "wait_selector", selector: "main", timeout_ms: 8000 },
+    wait_js: { type: "wait_js", condition: "document.readyState === 'complete'", timeout_ms: 8000 },
+    scroll: { type: "scroll", direction: "vertical", distance_px: 600, operations: 3, delay_ms: 400 },
+    click: { type: "click", selector: "a.read-more", wait_after_ms: 1000 },
+    end_session: { type: "end_session" }
+  };
+  var ta = document.getElementById("interaction-json");
+  function parseCurrent() {
+    var raw = ta.value.trim();
+    if (!raw) return { actions: [], on_error: "abort" };
+    var seq = JSON.parse(raw);
+    if (!seq || typeof seq !== "object" || !Array.isArray(seq.actions)) {
+      throw new Error('expected {"actions": [...]} at the top level');
+    }
+    return seq;
+  }
+  function write(seq) { ta.value = JSON.stringify(seq, null, 2); }
+  document.getElementById("interaction-palette").addEventListener("click", function (event) {
+    var btn = event.target.closest("button[data-snippet]");
+    if (!btn) return;
+    try {
+      var seq = parseCurrent();
+      seq.actions.push(JSON.parse(JSON.stringify(SNIPPETS[btn.getAttribute("data-snippet")])));
+      write(seq);
+    } catch (err) {
+      window.appToast("Current JSON is invalid: " + err.message, "err");
+    }
+  });
+  document.getElementById("interaction-format").addEventListener("click", function () {
+    try { write(parseCurrent()); } catch (err) { window.appToast("Current JSON is invalid: " + err.message, "err"); }
+  });
+})();
+</script>
+{% endblock %}

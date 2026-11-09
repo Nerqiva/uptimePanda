@@ -1427,3 +1427,103 @@ button[disabled] {
 
 /* .empty-state is intentionally NOT redefined here — the ported
    implementation (centered panel, h2 + p) already covers the monitoring UI. */
+
+/* ---- SEG-11 additive: tables & skip link ----
+   Minimal table styling reusing panel/border tokens; additive only. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 400;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  color: var(--text);
+}
+.skip-link:focus {
+  left: 12px;
+  top: 12px;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.table th {
+  text-align: left;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  font-weight: 600;
+}
+.table td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  vertical-align: middle;
+}
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.table tbody tr:hover td {
+  background: rgba(52, 211, 153, 0.04);
+}
+.table-actions {
+  white-space: nowrap;
+}
+.table-url {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.table-error {
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
+.history-pagination {
+  margin-top: 12px;
+}
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+.profile-card dl {
+  margin: 10px 0;
+}
+.profile-card .btn-row {
+  margin-top: 8px;
+}
+.modal-wide {
+  max-width: 560px;
+}
+.modal-wide .field-inline .field {
+  flex: 1;
+  margin-bottom: 10px;
+}
+.settings-row-form {
+  margin: 0;
+}
+.settings-row-form .field-inline {
+  flex-wrap: nowrap;
+}
+.settings-row-form .field-inline input {
+  min-width: 140px;
+}
+@media (max-width: 719px) {
+  .table {
+    font-size: 11px;
+  }
+  .table th:nth-child(4),
+  .table td:nth-child(4),
+  .table th:nth-child(6),
+  .table td:nth-child(6) {
+    display: none;
+  }
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+}

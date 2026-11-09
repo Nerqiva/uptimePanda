@@ -1,0 +1,40 @@
+<div id="history-wrap"{% if oob %} hx-swap-oob="outerHTML:#history-wrap"{% endif %}>
+{% if entries.is_empty() %}
+  <div class="empty-state">
+    <h2>No visits recorded</h2>
+    <p class="muted">The executor writes one row per visit. Nothing matches the current filters.</p>
+  </div>
+{% else %}
+<table class="table">
+  <thead>
+    <tr><th>Started (UTC)</th><th>Site</th><th>Profile</th><th>Duration</th><th>Outcome</th><th>HTTP</th><th>Error</th></tr>
+  </thead>
+  <tbody>
+    {% for e in entries %}
+    <tr>
+      <td class="muted">{{ e.started_label }}</td>
+      <td>{{ e.website_name }}</td>
+      <td>{{ e.profile_name }}</td>
+      <td>{{ e.duration_label }}</td>
+      <td><span class="pill {{ e.outcome_class }}">{{ e.outcome }}</span></td>
+      <td>{{ e.http_status }}</td>
+      <td class="muted table-error">{{ e.error }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<div class="btn-row history-pagination">
+  {% if page > 1 %}
+  <a class="btn small ghost" href="/history?{{ filter_query }}&page={{ page - 1 }}" hx-get="/fragments/history-rows?{{ filter_query }}&page={{ page - 1 }}" hx-target="#history-wrap" hx-swap="outerHTML" rel="prev">‹ Prev</a>
+  {% else %}
+  <span class="btn small is-disabled" aria-disabled="true">‹ Prev</span>
+  {% endif %}
+  <span class="muted">Page {{ page }} of {{ total_pages }}</span>
+  {% if page < total_pages %}
+  <a class="btn small ghost" href="/history?{{ filter_query }}&page={{ page + 1 }}" hx-get="/fragments/history-rows?{{ filter_query }}&page={{ page + 1 }}" hx-target="#history-wrap" hx-swap="outerHTML" rel="next">Next ›</a>
+  {% else %}
+  <span class="btn small is-disabled" aria-disabled="true">Next ›</span>
+  {% endif %}
+</div>
+{% endif %}
+</div>

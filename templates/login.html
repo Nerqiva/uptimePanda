@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Sign in · uptime·panda</title>
+<link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
+<link rel="stylesheet" href="/public/styles.css">
+</head>
+<body>
+<main class="content">
+<div class="card login-card">
+  <svg class="brand-mark" viewBox="0 0 64 64" width="56" height="56" aria-hidden="true">
+    <defs>
+      <linearGradient id="login-tile" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#242d40"/>
+        <stop offset="1" stop-color="#1c2333"/>
+      </linearGradient>
+    </defs>
+    <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#login-tile)" stroke="#2e3a52" stroke-width="2"/>
+    <circle cx="17.5" cy="19" r="7" fill="#0b0f1a"/>
+    <circle cx="46.5" cy="19" r="7" fill="#0b0f1a"/>
+    <circle cx="32" cy="36" r="17.5" fill="#34d399"/>
+    <circle cx="25" cy="34" r="2.6" fill="#0b0f1a"/>
+    <circle cx="39" cy="34" r="2.6" fill="#0b0f1a"/>
+    <ellipse cx="32" cy="44.5" rx="3.1" ry="2.2" fill="#0b0f1a"/>
+  </svg>
+  <h1 class="section-title">uptime·panda</h1>
+  <p class="muted">Lightweight browser keep-alive &amp; synthetic monitoring.</p>
+  {% if error != "" %}<p class="note err" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/login">
+    <label class="field">
+      <span>Dashboard password</span>
+      <input type="password" name="password" autocomplete="current-password" autofocus required>
+    </label>
+    <div class="btn-row">
+      <button class="btn primary" type="submit">Sign in</button>
+    </div>
+  </form>
+  <p class="muted">Authorized, owned websites only. Do not monitor targets you do not control.</p>
+</div>
+</main>
+</body>
+</html>

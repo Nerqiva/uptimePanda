@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Restore complete · uptime·panda</title>
+<link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
+<link rel="stylesheet" href="/public/styles.css">
+</head>
+<body>
+<main class="content">
+<div class="card login-card">
+  <h2 class="section-title">Restore complete</h2>
+  <p>The uploaded backup was validated and swapped into place. The previous database was kept as <code>{{ bak_name }}</code>.</p>
+  <p class="warn-line"><strong>Restart the uptimePanda process (or the container) now.</strong> The running process still holds the old database open; without a restart, new writes go nowhere and the restore takes effect only after restart.</p>
+  <p><a href="/system">Back to system page</a></p>
+</div>
+</main>
+</body>
+</html>

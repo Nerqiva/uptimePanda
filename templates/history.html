@@ -1,0 +1,29 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card">
+  <form method="get" action="/history" class="log-toolbar">
+    <div class="session-picker">
+      <div class="field">
+        <span>Website</span>
+        <select name="website_id">
+          <option value="">All websites</option>
+          {% for w in websites %}<option value="{{ w.id }}"{% if w.id == selected_website %} selected{% endif %}>{{ w.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <span>Outcome</span>
+        <select name="outcome">
+          <option value="">All outcomes</option>
+          {% for o in outcomes %}<option value="{{ o.value }}"{% if o.value == selected_outcome %} selected{% endif %}>{{ o.label }}</option>{% endfor %}
+        </select>
+      </div>
+      <button class="btn" type="submit">Apply</button>
+    </div>
+    <p class="muted">{{ total }} row(s) · 20 per page</p>
+  </form>
+  <div id="history-wrap">
+    {% set oob = false %}
+    {% include "partials/history_rows.html" %}
+  </div>
+</div>
+{% endblock %}

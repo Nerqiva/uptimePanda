@@ -1,0 +1,77 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card">
+  <div class="log-toolbar">
+    <div class="btn-row">
+      <button class="btn primary" type="button" data-modal-open="profile-add-modal">Add profile</button>
+      <form method="post" action="/profiles/cookies/clear-all" hx-post="/profiles/cookies/clear-all" hx-swap="none">
+        <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+        <button class="btn ghost" type="submit" data-confirm="Clear cookies in every profile?|Clear all">Clear all cookies</button>
+      </form>
+    </div>
+    <p class="muted">User-agent override (compatibility testing) — does not reproduce engine, OS, hardware or network characteristics. No fingerprint spoofing.</p>
+  </div>
+  <div id="profile-form-error" class="note err" role="alert"></div>
+  {% set oob = false %}
+  {% include "partials/profiles_grid.html" %}
+</div>
+
+<div class="modal-overlay" id="profile-add-modal" hidden role="dialog" aria-modal="true" aria-label="Add profile">
+  <div class="modal-card">
+    <h2 class="modal-title">Add profile</h2>
+    <form method="post" action="/profiles" hx-post="/profiles" hx-swap="none" id="profile-add-form">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <div class="field"><span>Name</span><input type="text" name="name" maxlength="100" required autocomplete="off"></div>
+      <div class="field"><span>Description</span><input type="text" name="description" maxlength="300" autocomplete="off"></div>
+      <div class="field"><span>User-agent override (compatibility)</span><select name="ua_preset"><option value="">Engine default</option>{% for p in presets %}<option value="{{ p.id }}">{{ p.label }}</option>{% endfor %}<option value="custom">Custom string…</option></select></div>
+      <div class="field"><span>Custom user-agent (optional)</span><input type="text" name="user_agent" maxlength="512" autocomplete="off" placeholder="Leave empty to use the preset / engine default"></div>
+      <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      <div class="modal-actions">
+        <button type="submit" class="btn primary">Add profile</button>
+        <button type="button" class="btn ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay" id="profile-edit-modal" hidden role="dialog" aria-modal="true" aria-label="Edit profile">
+  <div class="modal-card">
+    <h2 class="modal-title">Edit profile</h2>
+    <form id="profile-edit-form" method="post" action="/profiles/0" hx-patch="/profiles/0" hx-swap="none">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <div class="field"><span>Name</span><input type="text" name="name" id="profile-edit-name" maxlength="100" required autocomplete="off"></div>
+      <div class="field"><span>Description</span><input type="text" name="description" id="profile-edit-description" maxlength="300" autocomplete="off"></div>
+      <div class="field"><span>User-agent override (compatibility)</span><select name="ua_preset" id="profile-edit-preset"><option value="">Engine default</option>{% for p in presets %}<option value="{{ p.id }}">{{ p.label }}</option>{% endfor %}<option value="custom">Custom string…</option></select></div>
+      <div class="field"><span>Custom user-agent (optional)</span><input type="text" name="user_agent" id="profile-edit-ua" maxlength="512" autocomplete="off"></div>
+      <label class="check"><input type="checkbox" name="enabled" id="profile-edit-enabled"> Enabled</label>
+      <div class="modal-actions">
+        <button type="submit" class="btn primary">Save changes</button>
+        <button type="button" class="btn ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var form = document.getElementById("profile-edit-form");
+  var forms = document.querySelectorAll("#profile-add-form, #profile-edit-form");
+  forms.forEach(function (f) {
+    f.addEventListener("submit", function () { window.appHideModals(); });
+  });
+  document.body.addEventListener("click", function (event) {
+    var btn = event.target.closest("[data-profile-id]");
+    if (!btn) return;
+    var id = btn.getAttribute("data-profile-id");
+    document.getElementById("profile-edit-name").value = btn.getAttribute("data-name") || "";
+    document.getElementById("profile-edit-description").value = btn.getAttribute("data-description") || "";
+    document.getElementById("profile-edit-preset").value = btn.getAttribute("data-ua-preset") || "";
+    document.getElementById("profile-edit-ua").value = btn.getAttribute("data-ua") || "";
+    document.getElementById("profile-edit-enabled").checked = btn.getAttribute("data-enabled") === "true";
+    var target = "/profiles/" + id;
+    form.setAttribute("hx-patch", target);
+    form.setAttribute("action", target);
+  });
+})();
+</script>
+{% endblock %}

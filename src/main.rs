@@ -1,8 +1,6 @@
 //! uptimePanda — lightweight browser keep-alive & synthetic monitoring.
-//! Boots an HTTP listener exposing `/health`. SEG-04: resolves the
-//! deployment config from the environment, seeds the DB-backed settings,
-//! then serves. SEG-10: starts the scheduler + executor job loop (visit
-//! gate honoured inside `Executor::execute`).
+//! `/health` stays open and browser-free; everything else is behind the
+//! session middleware. SEG-11: HTMX dashboard served by `web::routes`.
 
 mod browser;
 mod config;
@@ -16,8 +14,6 @@ mod security;
 mod state;
 mod web;
 
-use axum::{Json, Router, http::StatusCode, routing::get};
-use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 /// Version string, sourced from the VERSION file (trailing newline trimmed at use).
@@ -158,25 +154,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::warn!("lightpanda unavailable; scheduler not started (no jobs will be emitted)");
     }
-    // Kept for SEG-11/16 (pause/resume/web API) and SEG-21 (shutdown).
-    let _scheduler_handle = scheduler_handle;
-    let _browser_manager = manager;
+    let app_state = state::SharedState::new(state::AppState::new(
+        db.clone(),
+        manager.clone(),
+        scheduler_handle.clone(),
+        &config,
+        VERSION.trim(),
+    ));
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .fallback(not_found);
+    let app = web::routes::build_router(app_state);
 
     let addr = std::net::SocketAddr::from((config.bind_addr, config.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, version = VERSION.trim(), "uptimepanda listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
-}
-
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok", "version": VERSION.trim() }))
-}
-
-async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
 }

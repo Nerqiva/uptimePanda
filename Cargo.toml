@@ -26,7 +26,7 @@ time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macr
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rusqlite = "0.8.0"
 tokio-tungstenite = "0.30.0"
-tower = "0.5.3"
+tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url = "2.5.8"

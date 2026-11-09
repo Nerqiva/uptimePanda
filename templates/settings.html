@@ -1,0 +1,34 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card">
+  <p class="muted">Every runtime tunable from the seed table is editable below. Validation bounds are enforced server-side on save; invalid input is rejected with a message. Boolean keys accept <code>true</code>/<code>false</code>. <code>concurrent_visits</code> is pinned to 1 by design. Grouping, help text and restore-defaults land in SEG-14.</p>
+  <div class="chiprow"><span class="chip">23 keys</span><span class="chip">validated on write</span></div>
+</div>
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>Setting</th><th>Current</th><th>Default</th><th>Bounds</th><th>Save</th></tr>
+    </thead>
+    <tbody>
+      {% for s in settings %}
+      <tr>
+        <td><div>{{ s.key }}</div><div class="muted table-url">{{ s.help }}</div></td>
+        <td><code>{{ s.value }}</code>{% if s.value == s.default %} <span class="pill">default</span>{% else %} <span class="pill warn">modified</span>{% endif %}</td>
+        <td class="muted"><code>{{ s.default }}</code></td>
+        <td class="muted">{{ s.bounds }}</td>
+        <td>
+          <form method="post" action="/settings" hx-patch="/settings" hx-swap="none" class="settings-row-form">
+            <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+            <input type="hidden" name="key" value="{{ s.key }}">
+            <div class="field-inline">
+              <input type="text" name="value" value="{{ s.value }}" aria-label="{{ s.key }}" inputmode="{{ s.inputmode }}" autocomplete="off">
+              <button class="btn small" type="submit">Save</button>
+            </div>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

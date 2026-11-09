@@ -1,0 +1,42 @@
+<div class="stat-grid">
+  <div class="stat-card{% if stats.browser_running %} ok{% endif %}">
+    <span class="stat-label">Browser</span>
+    <span class="stat-value">{% if stats.browser_running %}up{% else %}down{% endif %}</span>
+    <span class="stat-sub">{{ stats.browser_sub }}</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Browser RSS</span>
+    <span class="stat-value">{{ stats.rss_mb }}</span>
+    <span class="stat-sub">MB / {{ stats.mem_restart_mb }} MB recycle</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">RSS vs threshold</span>
+    <meter min="0" max="{{ stats.mem_restart_mb }}" value="{{ stats.rss_mb_int }}">{{ stats.rss_ratio }}</meter>
+    <span class="stat-sub">{{ stats.rss_ratio }} of restart threshold</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Browser CPU</span>
+    <span class="stat-value">{{ stats.cpu_pct }}</span>
+    <span class="stat-sub">% of one core</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Browser uptime</span>
+    <span class="stat-value">{{ stats.uptime_label }}</span>
+    <span class="stat-sub">{{ stats.restarts_total }} restart(s) total</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Queue length</span>
+    <span class="stat-value">{{ stats.queue_len }}</span>
+    <span class="stat-sub">{{ stats.next_visit }}</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Database size</span>
+    <span class="stat-value">{{ stats.db_size_mb }}</span>
+    <span class="stat-sub">MB (main + WAL)</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">Memory available</span>
+    <span class="stat-value">{{ stats.mem_available_mb }}</span>
+    <span class="stat-sub">MB (host, /proc/meminfo)</span>
+  </div>
+</div>

@@ -1,0 +1,68 @@
+<div id="websites-table-wrap"{% if oob %} hx-swap-oob="outerHTML:#websites-table-wrap"{% endif %}>
+{% if entries.is_empty() %}
+  <div class="empty-state">
+    <h2>No websites yet</h2>
+    <p class="muted">Add the first monitor to start scheduling visits.</p>
+  </div>
+{% else %}
+<table class="table">
+  <thead>
+    <tr><th>Name</th><th>Profile</th><th>Mode</th><th>Status</th><th>Interval</th><th>Last visit (UTC)</th><th>Next visit (UTC)</th><th class="table-actions">Actions</th></tr>
+  </thead>
+  <tbody>
+    {% for entry in entries %}
+    <tr>
+      <td>
+        <div>{{ entry.website.name }}</div>
+        <div class="muted table-url">{{ entry.website.host_path }}</div>
+      </td>
+      <td>{{ entry.profile_name }}</td>
+      <td><span class="pill">{{ entry.website.mode }}</span></td>
+      <td>
+        {% if entry.website.enabled %}<span class="pill ok">enabled</span>{% else %}<span class="pill">disabled</span>{% endif %}
+        {% if entry.paused %}<span class="pill warn">paused</span>{% endif %}
+      </td>
+      <td>{{ entry.website.interval_label }}</td>
+      <td class="muted">{{ entry.website.last_visit_label }}</td>
+      <td class="muted">{{ entry.next_visit_label }}</td>
+      <td>
+        <div class="btn-row table-actions">
+          <form method="post" action="/websites/{{ entry.website.id }}/visit" hx-post="/websites/{{ entry.website.id }}/visit" hx-swap="none">
+            <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+            <button class="btn small ghost" type="submit" title="Visit now">Visit</button>
+          </form>
+          {% if entry.paused %}
+          <form method="post" action="/websites/{{ entry.website.id }}/resume" hx-post="/websites/{{ entry.website.id }}/resume" hx-swap="none">
+            <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+            <button class="btn small ghost" type="submit">Resume</button>
+          </form>
+          {% else %}
+          <form method="post" action="/websites/{{ entry.website.id }}/pause" hx-post="/websites/{{ entry.website.id }}/pause" hx-swap="none">
+            <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+            <button class="btn small ghost" type="submit">Pause</button>
+          </form>
+          {% endif %}
+          <button class="btn small ghost" type="button" data-modal-open="website-edit-modal"
+            data-id="{{ entry.website.id }}"
+            data-name="{{ entry.website.name }}"
+            data-url="{{ entry.website.url }}"
+            data-enabled="{{ entry.website.enabled }}"
+            data-profile-id="{{ entry.website.profile_id_label }}"
+            data-mode="{{ entry.website.mode }}"
+            data-min-interval="{{ entry.website.min_interval_seconds }}"
+            data-max-interval="{{ entry.website.max_interval_seconds }}"
+            data-min-session="{{ entry.website.min_session_seconds }}"
+            data-max-session="{{ entry.website.max_session_seconds }}">Edit</button>
+          <a class="btn small ghost" href="/websites/{{ entry.website.id }}/interactions">Interact</a>
+          <form method="post" action="/websites/{{ entry.website.id }}/delete" hx-delete="/websites/{{ entry.website.id }}" hx-swap="none">
+            <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+            <button class="btn small danger" type="submit" data-confirm="Delete {{ entry.website.name }}?|Delete">Delete</button>
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+</div>

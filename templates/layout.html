@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{ chrome.csrf }}">
+<title>{{ chrome.title }} · uptime·panda</title>
+<link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
+<link rel="stylesheet" href="/public/styles.css">
+<script src="/public/htmx.min.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<button class="rail-toggle" id="rail-toggle" aria-label="Toggle navigation" aria-controls="rail" aria-expanded="false"><span></span><span></span><span></span></button>
+<aside class="rail" id="rail">
+  <a class="brand" href="/" aria-label="uptimePanda home">
+    <svg class="brand-mark" viewBox="0 0 64 64" width="26" height="26" aria-hidden="true">
+      <defs>
+        <linearGradient id="brand-tile" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#242d40"/>
+          <stop offset="1" stop-color="#1c2333"/>
+        </linearGradient>
+      </defs>
+      <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#brand-tile)" stroke="#2e3a52" stroke-width="3"/>
+      <circle cx="17.5" cy="19" r="7" fill="#0b0f1a"/>
+      <circle cx="46.5" cy="19" r="7" fill="#0b0f1a"/>
+      <circle cx="32" cy="36" r="17.5" fill="#34d399"/>
+      <circle cx="25" cy="34" r="2.6" fill="#0b0f1a"/>
+      <circle cx="39" cy="34" r="2.6" fill="#0b0f1a"/>
+      <ellipse cx="32" cy="44.5" rx="3.1" ry="2.2" fill="#0b0f1a"/>
+    </svg>
+    <span class="brand-word">uptime<span class="brand-slash">·</span>panda</span>
+  </a>
+  <nav class="nav" aria-label="Main">
+    <a class="nav-link{% if chrome.active == "overview" %} active{% endif %}" href="/"{% if chrome.active == "overview" %} aria-current="page"{% endif %}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 12 8 12 11 5 14 19 17 12 21 12"/></svg><span>Overview</span></a>
+    <a class="nav-link{% if chrome.active == "websites" %} active{% endif %}" href="/websites"{% if chrome.active == "websites" %} aria-current="page"{% endif %}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M2.5 12h19"/><path d="M12 3a13 13 0 0 1 0 18a13 13 0 0 1 0-18z"/></svg><span>Websites</span></a>
+    <a class="nav-link{% if chrome.active == "profiles" %} active{% endif %}" href="/profiles"{% if chrome.active == "profiles" %} aria-current="page"{% endif %}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/></svg><span>Profiles</span></a>
+    <a class="nav-link{% if chrome.active == "history" %} active{% endif %}" href="/history"{% if chrome.active == "history" %} aria-current="page"{% endif %}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg><span>History</span></a>
+    <a class="nav-link{% if chrome.active == "system" %} active{% endif %}" href="/system"{% if chrome.active == "system" %} aria-current="page"{% endif %}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="16" x2="12" y2="20"/></svg><span>System</span></a>
+    <a class="nav-link{% if chrome.active == "settings" %} active{% endif %}" href="/settings"{% if chrome.active == "settings" %} aria-current="page"{% endif %}><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.1" fill="#242d40"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="15" cy="17" r="2.1" fill="#242d40"/></svg><span>Settings</span></a>
+  </nav>
+  <div class="rail-foot">
+    <div class="rail-status">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="dot-label">authed</span>
+    </div>
+    <form method="post" action="/logout" class="rail-logout">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <button class="btn small rail-btn" type="submit">Sign out</button>
+    </form>
+  </div>
+</aside>
+<div class="rail-overlay" id="rail-overlay"></div>
+<main class="content" id="main-content">
+<h1 class="page-title">{{ chrome.title }}</h1>
+{% block content %}{% endblock %}
+</main>
+<div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
+<script>
+(function () {
+  "use strict";
+
+  // Toast auto-dismiss: MutationObserver catches server-sent (OOB) and
+  // locally created toasts alike.
+  var region = document.getElementById("toast-region");
+  function arm(el) {
+    window.setTimeout(function () { el.classList.remove("show"); }, 3600);
+    window.setTimeout(function () { el.remove(); }, 4000);
+  }
+  if (region) {
+    var mo = new MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i++) {
+        var nodes = records[i].addedNodes;
+        for (var j = 0; j < nodes.length; j++) {
+          if (nodes[j].nodeType === 1) {
+            window.requestAnimationFrame(function (n) { return function () { n.classList.add("show"); }; }(nodes[j]));
+            arm(nodes[j]);
+          }
+        }
+      }
+    });
+    mo.observe(region, { childList: true });
+  }
+  window.appToast = function (message, kind) {
+    if (!region) return;
+    var el = document.createElement("div");
+    el.className = "toast " + (kind || "ok");
+    el.textContent = message;
+    region.appendChild(el);
+  };
+
+  // Busy state: flag submitting buttons while their request is in flight.
+  function actionButtons(elt) {
+    if (!elt || !elt.querySelectorAll) return [];
+    var trigger = elt.getAttribute && elt.getAttribute("hx-trigger");
+    if (trigger && trigger.indexOf("every") !== -1) return [];
+    if (elt.matches && elt.matches("button.btn")) return [elt];
+    return Array.prototype.slice.call(elt.querySelectorAll("button.btn"));
+  }
+  function mark(button, busy) {
+    button.disabled = busy;
+    button.classList.toggle("is-loading", busy);
+  }
+  document.body.addEventListener("htmx:before:request", function (event) {
+    var elt = event.detail && event.detail.ctx && event.detail.ctx.sourceElement;
+    actionButtons(elt).forEach(function (b) { mark(b, true); });
+  });
+  document.body.addEventListener("htmx:after:request", function (event) {
+    var elt = event.detail && event.detail.ctx && event.detail.ctx.sourceElement;
+    actionButtons(elt).forEach(function (b) { mark(b, false); });
+  });
+
+  // CSRF header backstop (hidden csrf_token form fields are the primary path).
+  document.body.addEventListener("htmx:config:request", function (event) {
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    var ctx = event.detail && event.detail.ctx;
+    if (meta && meta.content && ctx && ctx.request && ctx.request.headers) {
+      ctx.request.headers["X-CSRF-Token"] = meta.content;
+    }
+  });
+
+  // Shared confirm modal for destructive actions. [data-confirm] buttons are
+  // intercepted in the capture phase so htmx never sees the original click.
+  var pendingConfirm = null;
+  function showModal(id) {
+    var overlay = document.getElementById(id);
+    if (!overlay) return;
+    overlay.hidden = false;
+    var first = overlay.querySelector("button");
+    if (first) first.focus();
+  }
+  function hideModals() {
+    var overlays = document.querySelectorAll(".modal-overlay");
+    for (var i = 0; i < overlays.length; i++) overlays[i].hidden = true;
+  }
+  window.appShowModal = showModal;
+  window.appHideModals = hideModals;
+
+  document.body.addEventListener("click", function (event) {
+    var open = event.target.closest("[data-modal-open]");
+    if (open) {
+      event.preventDefault();
+      showModal(open.getAttribute("data-modal-open"));
+      return;
+    }
+    if (event.target.closest("[data-modal-close]") || event.target.classList.contains("modal-overlay")) {
+      hideModals();
+      return;
+    }
+    var cfm = event.target.closest("[data-confirm]");
+    if (cfm && !cfm.hasAttribute("data-confirmed")) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      pendingConfirm = cfm;
+      var title = document.getElementById("confirm-modal-title");
+      var ok = document.getElementById("confirm-ok");
+      var parts = String(cfm.getAttribute("data-confirm") || "|").split("|");
+      if (title) title.textContent = parts[0] || "Confirm";
+      if (ok) ok.textContent = parts[1] || "Confirm";
+      showModal("confirm-modal");
+    }
+  }, true);
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") hideModals();
+  });
+
+  document.body.addEventListener("click", function (event) {
+    if (event.target.id !== "confirm-ok") return;
+    if (!pendingConfirm) { hideModals(); return; }
+    var btn = pendingConfirm;
+    pendingConfirm = null;
+    btn.setAttribute("data-confirmed", "1");
+    hideModals();
+    btn.click();
+    btn.removeAttribute("data-confirmed");
+  });
+})();
+</script>
+<script>
+var railBtn = document.getElementById("rail-toggle");
+var railOverlay = document.getElementById("rail-overlay");
+var railBody = document.body;
+
+function setRail(open) {
+  railBody.classList.toggle("rail-open", open);
+  railBtn.setAttribute("aria-expanded", String(open));
+}
+
+var isMobile = window.matchMedia("(max-width: 719px)").matches;
+var stored = localStorage.getItem("rail-open");
+setRail(isMobile ? false : stored !== "0");
+
+railBtn.addEventListener("click", function () {
+  setRail(!railBody.classList.contains("rail-open"));
+  localStorage.setItem("rail-open", railBody.classList.contains("rail-open") ? "1" : "0");
+});
+railOverlay.addEventListener("click", function () {
+  setRail(false);
+});
+</script>
+<div class="modal-overlay" id="confirm-modal" hidden role="dialog" aria-modal="true" aria-label="Confirm">
+  <div class="modal-card">
+    <h2 class="modal-title" id="confirm-modal-title">Confirm</h2>
+    <div class="modal-actions">
+      <button type="button" class="btn danger" id="confirm-ok">Confirm</button>
+      <button type="button" class="btn ghost" data-modal-close>Cancel</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>

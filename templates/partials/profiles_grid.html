@@ -1,0 +1,40 @@
+<div class="card-grid" id="profiles-grid"{% if oob %} hx-swap-oob="outerHTML:#profiles-grid"{% endif %}>
+{% if entries.is_empty() %}
+  <div class="empty-state">
+    <h2>No profiles yet</h2>
+    <p class="muted">Profiles isolate cookies per monitor. The two seeded compatibility profiles are a good starting point.</p>
+  </div>
+{% else %}
+  {% for p in entries %}
+  <div class="card profile-card">
+    <div class="chiprow">
+      <strong>{{ p.name }}</strong>
+      {% if p.enabled %}<span class="pill ok">enabled</span>{% else %}<span class="pill">disabled</span>{% endif %}
+    </div>
+    {% if p.description != "" %}<p class="muted">{{ p.description }}</p>{% endif %}
+    <dl class="detail-grid">
+      <div><dt>User-agent</dt><dd>{{ p.ua_label }}</dd></div>
+      <div><dt>Cookies</dt><dd>{{ p.cookie_count }} jar(s){% if p.earliest_expiry != "" %} · oldest expiry {{ p.earliest_expiry }}{% endif %}</dd></div>
+      <div><dt>Used by</dt><dd>{{ p.assigned }}</dd></div>
+    </dl>
+    <div class="btn-row">
+      <button class="btn small ghost" type="button" data-modal-open="profile-edit-modal"
+        data-profile-id="{{ p.id }}"
+        data-name="{{ p.name }}"
+        data-description="{{ p.description }}"
+        data-ua-preset="{{ p.ua_preset }}"
+        data-ua="{{ p.user_agent }}"
+        data-enabled="{{ p.enabled }}">Edit</button>
+      <form method="post" action="/profiles/{{ p.id }}/cookies/clear" hx-post="/profiles/{{ p.id }}/cookies/clear" hx-swap="none">
+        <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+        <button class="btn small ghost" type="submit" data-confirm="Clear all cookies of {{ p.name }}?|Clear">Clear cookies</button>
+      </form>
+      <form method="post" action="/profiles/{{ p.id }}/delete" hx-delete="/profiles/{{ p.id }}" hx-swap="none">
+        <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+        <button class="btn small danger" type="submit" data-confirm="Delete {{ p.name }}? Cookies are destroyed; websites keep their config with no profile.|Delete">Delete</button>
+      </form>
+    </div>
+  </div>
+  {% endfor %}
+{% endif %}
+</div>

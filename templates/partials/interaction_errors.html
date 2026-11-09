@@ -1,0 +1,1 @@
+<div id="interaction-errors"{% if oob %} hx-swap-oob="outerHTML:#interaction-errors"{% endif %}>{% if !errors.is_empty() %}<div class="note err" role="alert"><strong>Validation failed:</strong><ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}</div>

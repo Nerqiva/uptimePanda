@@ -1,0 +1,95 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card">
+  <div class="log-toolbar">
+    <div>
+      <button class="btn primary" type="button" data-modal-open="website-add-modal">Add website</button>
+    </div>
+    <p class="muted">{{ entries.len() }} monitored site(s) · all visits use the active Lightpanda profile jar</p>
+  </div>
+  <div id="website-form-error" class="note err" role="alert">{% if form_error != "" %}{{ form_error }}{% endif %}</div>
+  {% set oob = false %}
+  {% include "partials/websites_table.html" %}
+</div>
+
+<div class="modal-overlay" id="website-add-modal" hidden role="dialog" aria-modal="true" aria-label="Add website">
+  <div class="modal-card modal-wide">
+    <h2 class="modal-title">Add website</h2>
+    <form method="post" action="/websites" hx-post="/websites" hx-swap="none" id="website-add-form">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <div class="field"><span>Name</span><input type="text" name="name" maxlength="200" required autocomplete="off"></div>
+      <div class="field"><span>URL (http/https)</span><input type="url" name="url" required autocomplete="off" placeholder="https://example.com/"></div>
+      <div class="field"><span>Profile</span><select name="profile_id"><option value="">Default (all cookies isolated)</option>{% for p in profiles %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}</select></div>
+      <div class="field"><span>Monitoring mode</span><select name="monitoring_mode"><option value="basic">basic — navigate, hold, close</option><option value="interaction">interaction — replay configured actions</option></select></div>
+      <div class="field-inline">
+        <div class="field"><span>Min interval (s)</span><input type="number" name="min_interval_seconds" value="480" min="30" max="86400" required></div>
+        <div class="field"><span>Max interval (s)</span><input type="number" name="max_interval_seconds" value="780" min="30" max="86400" required></div>
+      </div>
+      <div class="field-inline">
+        <div class="field"><span>Min session (s)</span><input type="number" name="min_session_seconds" value="15" min="5" max="3600" required></div>
+        <div class="field"><span>Max session (s)</span><input type="number" name="max_session_seconds" value="60" min="5" max="3600" required></div>
+      </div>
+      <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      <div class="modal-actions">
+        <button type="submit" class="btn primary">Add website</button>
+        <button type="button" class="btn ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal-overlay" id="website-edit-modal" hidden role="dialog" aria-modal="true" aria-label="Edit website">
+  <div class="modal-card modal-wide">
+    <h2 class="modal-title">Edit website</h2>
+    <form id="website-edit-form" method="post" action="/websites/0" hx-patch="/websites/0" hx-swap="none">
+      <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+      <div class="field"><span>Name</span><input type="text" name="name" id="website-edit-name" maxlength="200" required autocomplete="off"></div>
+      <div class="field"><span>URL (http/https)</span><input type="url" name="url" id="website-edit-url" required autocomplete="off"></div>
+      <div class="field"><span>Profile</span><select name="profile_id" id="website-edit-profile"><option value="">Default (all cookies isolated)</option>{% for p in profiles %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}</select></div>
+      <div class="field"><span>Monitoring mode</span><select name="monitoring_mode" id="website-edit-mode"><option value="basic">basic — navigate, hold, close</option><option value="interaction">interaction — replay configured actions</option></select></div>
+      <div class="field-inline">
+        <div class="field"><span>Min interval (s)</span><input type="number" name="min_interval_seconds" id="website-edit-min-interval" min="30" max="86400" required></div>
+        <div class="field"><span>Max interval (s)</span><input type="number" name="max_interval_seconds" id="website-edit-max-interval" min="30" max="86400" required></div>
+      </div>
+      <div class="field-inline">
+        <div class="field"><span>Min session (s)</span><input type="number" name="min_session_seconds" id="website-edit-min-session" min="5" max="3600" required></div>
+        <div class="field"><span>Max session (s)</span><input type="number" name="max_session_seconds" id="website-edit-max-session" min="5" max="3600" required></div>
+      </div>
+      <label class="check"><input type="checkbox" name="enabled" id="website-edit-enabled"> Enabled</label>
+      <div class="modal-actions">
+        <button type="submit" class="btn primary">Save changes</button>
+        <button type="button" class="btn ghost" data-modal-close>Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var form = document.getElementById("website-edit-form");
+  // Any website form (add or edit) closes the modal on submit; the server
+  // re-renders the table and any validation error inline via OOB swaps.
+  var forms = document.querySelectorAll("#website-add-form, #website-edit-form");
+  forms.forEach(function (f) {
+    f.addEventListener("submit", function () { window.appHideModals(); });
+  });
+  document.body.addEventListener("click", function (event) {
+    var btn = event.target.closest("[data-id][data-name]");
+    if (!btn) return;
+    var id = btn.getAttribute("data-id");
+    document.getElementById("website-edit-name").value = btn.getAttribute("data-name") || "";
+    document.getElementById("website-edit-url").value = btn.getAttribute("data-url") || "";
+    document.getElementById("website-edit-profile").value = btn.getAttribute("data-profile-id") || "";
+    document.getElementById("website-edit-mode").value = btn.getAttribute("data-mode") || "basic";
+    document.getElementById("website-edit-min-interval").value = btn.getAttribute("data-min-interval") || "480";
+    document.getElementById("website-edit-max-interval").value = btn.getAttribute("data-max-interval") || "780";
+    document.getElementById("website-edit-min-session").value = btn.getAttribute("data-min-session") || "15";
+    document.getElementById("website-edit-max-session").value = btn.getAttribute("data-max-session") || "60";
+    document.getElementById("website-edit-enabled").checked = btn.getAttribute("data-enabled") === "true";
+    var target = "/websites/" + id;
+    form.setAttribute("hx-patch", target);
+    form.setAttribute("action", target);
+  });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card">
+  <div class="chiprow">
+    <span class="chip">v{{ chrome.version }}</span>
+    <span class="chip">authorized, owned sites only</span>
+  </div>
+  <div id="overview-grid" hx-get="/fragments/overview" hx-trigger="load, every 3s" hx-swap="innerHTML">
+    {% include "partials/overview_grid.html" %}
+  </div>
+</div>
+{% endblock %}
