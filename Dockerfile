@@ -29,8 +29,10 @@ RUN apt-get update \
 WORKDIR /build
 
 # Dependency layer: cached until the manifests change.
+# Cargo parses the manifest to resolve deps and requires a target to exist,
+# so prime with a dummy main.rs before fetching (real sources overwrite it).
 COPY Cargo.toml Cargo.lock ./
-RUN cargo fetch --locked
+RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs && cargo fetch --locked && rm -rf src
 
 # Sources (Askama templates and VERSION are embedded at compile time).
 COPY src/ src/
