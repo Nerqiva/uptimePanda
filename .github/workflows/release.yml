@@ -96,7 +96,7 @@ jobs:
           nl = "\r\n" if "\r\n" in content else "\n"
           block = (
               "<!-- version:start -->" + nl
-              + "**Version:** " + version + " ([changelog](../blob/main/CHANGELOG.md)) — released " + date
+              + "**Version:** " + version + " ([changelog](CHANGELOG.md)) — released " + date
               + " · [prerelease " + tag + "](https://github.com/Nerqiva/uptimePanda/releases/tag/" + tag + ")" + nl
               + "<!-- version:end -->"
           )
