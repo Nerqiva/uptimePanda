@@ -102,6 +102,9 @@ pub fn build_router(state: SharedState) -> axum::Router {
         .merge(protected)
         .fallback(not_found)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        // SEG-13: outermost — every response, incl. fallbacks, gets the
+        // security header set (see web::headers).
+        .layer(middleware::from_fn(crate::web::headers::security_headers))
         .with_state(state)
 }
 
@@ -166,9 +169,9 @@ fn build_chrome(
     state: &AppState,
     title: &str,
     active: &'static str,
-    session: &SessionInfo,
+    _session: &SessionInfo,
 ) -> LayoutChrome {
-    LayoutChrome::new(state, title, active, session.expiry_unix)
+    LayoutChrome::new(state, title, active)
 }
 
 fn render_fmt<T: Template>(t: &T) -> Result<String, AppError> {
@@ -2707,15 +2710,15 @@ mod tests {
     #[test]
     fn csrf_token_stable_and_constant_time_check() {
         let key = [9u8; 32];
-        let t1 = crate::web::csrf::csrf_token(&key, 1_700_000_000);
-        let t2 = crate::web::csrf::csrf_token(&key, 1_700_000_000);
-        let t3 = crate::web::csrf::csrf_token(&key, 1_700_000_001);
+        let t1 = crate::web::csrf::csrf_token(&key);
+        let t2 = crate::web::csrf::csrf_token(&key);
+        let t3 = crate::web::csrf::csrf_token(&[1u8; 32]);
         assert_eq!(t1, t2);
         assert_ne!(t1, t3);
         assert!(crate::web::csrf::tokens_equal(&t1, &t2));
         assert!(!crate::web::csrf::tokens_equal(&t1, &t3));
         assert!(!crate::web::csrf::tokens_equal(&t1, "zz"));
-        assert!(crate::web::csrf::verify(&key, 1_700_000_000, &t1));
+        assert!(crate::web::csrf::verify(&key, &t1));
     }
 
     #[test]
@@ -2758,5 +2761,314 @@ mod tests {
     #[test]
     fn form_urlencoded_value_encodes() {
         assert_eq!(form_urlencoded_value("a b&c=d"), "a%20b%26c%3Dd");
+    }
+    // --- SEG-13: security headers, renewal, trust-proxy tests ---
+
+    fn assert_security_headers(headers: &HeaderMap, hsts: bool, no_store: bool) {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(get("x-frame-options").as_deref(), Some("DENY"));
+        assert_eq!(get("x-content-type-options").as_deref(), Some("nosniff"));
+        assert_eq!(get("referrer-policy").as_deref(), Some("no-referrer"));
+        let csp = get("content-security-policy").expect("CSP present");
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+        assert!(!csp.contains("unsafe-eval"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("base-uri 'none'"), "{csp}");
+        assert!(csp.contains("form-action 'self'"), "{csp}");
+        assert!(csp.contains("img-src 'self' data:"), "{csp}");
+        assert!(csp.contains("font-src 'self'"), "{csp}");
+        assert!(csp.contains("connect-src 'self'"), "{csp}");
+        let hsts_value = get("strict-transport-security");
+        if hsts {
+            assert_eq!(
+                hsts_value.as_deref(),
+                Some("max-age=31536000; includeSubDomains")
+            );
+        } else {
+            assert!(hsts_value.is_none(), "HSTS must not leak onto plain HTTP");
+        }
+        let cache = get("cache-control");
+        if no_store {
+            assert_eq!(cache.as_deref(), Some("no-store"));
+        }
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_health_get() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let (status, headers, _b) = request(app(state), "GET", "/health", &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_security_headers(&headers, false, true);
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_root_redirect_when_unauthenticated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let (status, headers, _b) = request(app(state), "GET", "/", &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_security_headers(&headers, false, true);
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_404_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let (status, headers, _b) =
+            request(app(state), "GET", "/no-such-page", &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_security_headers(&headers, false, true);
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_authed_page_and_static_asset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        // Authed HTML page: no-store.
+        let (status, headers, _b) = request(
+            app.clone(),
+            "GET",
+            "/",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_security_headers(&headers, false, true);
+        // Static asset: keeps its own cache policy, still gets the base set.
+        let (status, headers, _b) =
+            request(app, "GET", "/public/styles.css", &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        let cache = headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(cache.contains("max-age=3600"), "{cache}");
+        assert!(!cache.contains("no-store"), "{cache}");
+        assert_security_headers(&headers, false, false);
+    }
+
+    #[tokio::test]
+    async fn hsts_only_when_forwarded_proto_https() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state);
+        let (_s, headers, _b) = request(
+            app.clone(),
+            "GET",
+            "/health",
+            &[("x-forwarded-proto", "https")],
+            Body::empty(),
+        )
+        .await;
+        assert_security_headers(&headers, true, true);
+        // Case-insensitive per RFC 7230 §3.2.6 + the middleware's fold.
+        let (_s, headers, _b) = request(
+            app.clone(),
+            "GET",
+            "/health",
+            &[("x-forwarded-proto", "HTTPS")],
+            Body::empty(),
+        )
+        .await;
+        assert_security_headers(&headers, true, true);
+        // Explicit http → never HSTS.
+        let (_s, headers, _b) = request(
+            app,
+            "GET",
+            "/health",
+            &[("x-forwarded-proto", "http")],
+            Body::empty(),
+        )
+        .await;
+        assert_security_headers(&headers, false, true);
+    }
+
+    #[tokio::test]
+    async fn login_sets_secure_cookie_only_behind_https_proxy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Plain HTTP (no proxy header): cookie must NOT be Secure, so
+        // plain-HTTP deployments keep working.
+        let state = in_memory_state(dir.path()).await;
+        let (status, headers, _b) = request(
+            app(state),
+            "POST",
+            "/login",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            Body::from(format!("password={TEST_PASSWORD}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let cookie = headers
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("set-cookie")
+            .to_string();
+        assert!(!cookie.contains("Secure"), "{cookie}");
+
+        // HTTPS at the proxy: cookie gets Secure.
+        let state = in_memory_state(dir.path()).await;
+        let (status, headers, _b) = request(
+            app(state),
+            "POST",
+            "/login",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("x-forwarded-proto", "https"),
+            ],
+            Body::from(format!("password={TEST_PASSWORD}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let cookie = headers
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("set-cookie")
+            .to_string();
+        assert!(cookie.contains("; Secure"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn sliding_renewal_reissues_expiring_session_cookie() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let key = state.session_key;
+        let app = app(state);
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // Session with 2h of TTL left (< 6h threshold) → renewal expected.
+        let old_value = crate::web::auth::sign_session(&key, now + 2 * 3600);
+        let (status, headers, _b) = request(
+            app.clone(),
+            "GET",
+            "/",
+            &[("cookie", format!("uptime_session={old_value}").as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let renewed = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with("uptime_session="))
+            .expect("renewed session cookie appended")
+            .to_string();
+        let pair = renewed.split(';').next().expect("cookie pair");
+        let value = pair.split('=').nth(1).expect("cookie value");
+        let expiry =
+            crate::web::auth::verify_session(&key, value).expect("renewed cookie verifies");
+        let remaining = expiry - time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(
+            (12 * 3600 - 30..=12 * 3600).contains(&remaining),
+            "renewed cookie should carry a fresh 12h TTL, got {remaining}s"
+        );
+
+        // Fresh session (> 6h left) → no renewal, no Set-Cookie.
+        let fresh_value = crate::web::auth::sign_session(&key, now + 11 * 3600);
+        let (status, headers, _b) = request(
+            app,
+            "GET",
+            "/",
+            &[("cookie", format!("uptime_session={fresh_value}").as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let any_session_cookie = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with("uptime_session="));
+        assert!(!any_session_cookie, "fresh session must not be renewed");
+    }
+
+    #[tokio::test]
+    async fn sliding_renewal_preserves_secure_behind_https_proxy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let key = state.session_key;
+        let app = app(state);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let old_value = crate::web::auth::sign_session(&key, now + 3600);
+        let (status, headers, _b) = request(
+            app,
+            "GET",
+            "/",
+            &[
+                ("cookie", format!("uptime_session={old_value}").as_str()),
+                ("x-forwarded-proto", "https"),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let renewed = headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with("uptime_session="))
+            .expect("renewed cookie")
+            .to_string();
+        assert!(renewed.contains("; Secure"), "{renewed}");
+    }
+
+    #[tokio::test]
+    async fn csrf_rejects_equal_length_wrong_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+        // Same length, valid hex, wrong value (constant-time compare path).
+        let wrong: String = csrf
+            .chars()
+            .map(|c| if c == '0' { '1' } else { '0' })
+            .collect();
+        assert_eq!(csrf.len(), wrong.len());
+        let (status, _h, _b) = request(
+            app,
+            "PATCH",
+            "/settings",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!(
+                "key=memory_restart_mb&value=150&csrf_token={wrong}"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn app_js_is_served_as_javascript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let (status, headers, body) =
+            request(app(state), "GET", "/public/app.js", &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(ct.starts_with("text/javascript"), "{ct}");
+        let text = String::from_utf8(body).expect("app.js utf-8");
+        assert!(text.contains("window.appToast"));
+        assert!(text.contains("htmx:config:request"));
     }
 }

@@ -1527,3 +1527,14 @@ button[disabled] {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- authorized-use footer (persistent, layout-wide) ---- */
+.app-footer {
+  max-width: 1400px;
+  margin: 4px auto 12px;
+  padding: 0 16px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+  opacity: 0.85;
+}

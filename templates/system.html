@@ -60,36 +60,4 @@
   </table>
   {% endif %}
 </div>
-<script>
-(function () {
-  "use strict";
-  var submit = document.getElementById("restore-submit");
-  var fileInput = document.getElementById("restore-file");
-  var result = document.getElementById("restore-result");
-  submit.addEventListener("click", function () {
-    var file = fileInput.files && fileInput.files[0];
-    if (!file) { result.textContent = "Choose a backup file first."; result.className = "note err"; return; }
-    var meta = document.querySelector('meta[name="csrf-token"]');
-    var headers = { "content-type": "application/octet-stream" };
-    if (meta && meta.content) headers["x-csrf-token"] = meta.content;
-    result.textContent = "Uploading…";
-    result.className = "note";
-    fetch("/backup/restore", { method: "POST", headers: headers, body: file })
-      .then(function (res) { return res.text().then(function (body) { return { status: res.status, body: body }; }); })
-      .then(function (out) {
-        if (out.status === 200) {
-          result.className = "note";
-          result.innerHTML = out.body;
-        } else {
-          result.className = "note err";
-          result.textContent = "Restore failed (" + out.status + ")";
-        }
-      })
-      .catch(function () {
-        result.className = "note err";
-        result.textContent = "Restore failed: network error";
-      });
-  });
-})();
-</script>
 {% endblock %}

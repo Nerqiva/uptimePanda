@@ -27,11 +27,11 @@ pub struct LayoutChrome {
 }
 
 impl LayoutChrome {
-    pub fn new(state: &AppState, title: &str, active: &'static str, expiry_unix: i64) -> Self {
+    pub fn new(state: &AppState, title: &str, active: &'static str) -> Self {
         Self {
             title: title.to_string(),
             active,
-            csrf: csrf::csrf_token(&state.session_key, expiry_unix),
+            csrf: csrf::csrf_token(&state.session_key),
             version: state.version.trim(),
         }
     }

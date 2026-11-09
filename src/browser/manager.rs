@@ -85,6 +85,38 @@ use crate::db::Db;
 
 /// Default CDP port for Lightpanda.
 pub const DEFAULT_BASE_PORT: u16 = 9222;
+/// The ONLY host the Lightpanda CDP server is allowed to bind. Loopback,
+/// hard-coded, never read from the environment or CLI: `BROWSER_BINARY`
+/// swaps the binary, `LIGHTPANDA_CDP_PORT` swaps the port, and there is
+/// deliberately no host override path. Asserted at startup (see main.rs)
+/// and by the unit tests in this module.
+pub(crate) const CDP_HOST: &str = "127.0.0.1";
+
+/// Exact argument vector for `<binary> serve ...` — the loopback binding
+/// factored out so it is unit-testable in isolation.
+pub(crate) fn serve_args(port: u16) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--host".to_string(),
+        CDP_HOST.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--log-level".to_string(),
+        "info".to_string(),
+    ]
+}
+
+/// Startup self-check (called from main.rs before any spawn): the CDP
+/// server must be pinned to the loopback interface.
+pub fn cdp_binds_loopback() -> bool {
+    let args = serve_args(DEFAULT_BASE_PORT);
+    args.windows(2)
+        .any(|w| w[0] == "--host" && w[1] == CDP_HOST)
+        && CDP_HOST == "127.0.0.1"
+        && CDP_HOST
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback())
+}
 /// Port scan window: `base ..= base + PORT_SCAN` (i.e. up to 11 candidates).
 const PORT_SCAN: u16 = 10;
 /// How long to wait for `/json/version` after spawn.
@@ -426,13 +458,7 @@ async fn spawn_browser(base_port: u16, binary: &str) -> Result<(Child, u16, u32)
 
     loop {
         let mut cmd = Command::new(binary);
-        cmd.arg("serve")
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--log-level")
-            .arg("info")
+        cmd.args(serve_args(port))
             .env("LIGHTPANDA_DISABLE_TELEMETRY", "true")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
@@ -1232,6 +1258,32 @@ mod tests {
     use super::*;
 
     // --- pure parsers / counters ---
+
+    #[test]
+    fn serve_args_bind_loopback_exactly() {
+        let args = serve_args(9222);
+        assert_eq!(
+            args,
+            vec![
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "9222",
+                "--log-level",
+                "info",
+            ],
+            "spawn args must bind 127.0.0.1 and nothing else"
+        );
+        assert!(cdp_binds_loopback());
+        // The host argument is not user-controlled anywhere in the spawn
+        // path: BROWSER_BINARY only replaces the binary, LIGHTPANDA_CDP_PORT
+        // only the port. No argument may name a non-loopback host.
+        for arg in &args {
+            assert!(!arg.starts_with("0.0.0.0"));
+            assert!(!arg.contains("::"), "no IPv6 any-address in {arg}");
+        }
+    }
 
     #[test]
     fn parse_vm_rss_kb_reads_status() {

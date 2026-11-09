@@ -522,6 +522,16 @@ impl Executor {
         }
 
         // Redirect defence: the final URL must pass the same policy.
+        //
+        // Residual DNS-rebinding risk (documented, accepted): the pre-visit
+        // check resolved the host to public addresses at t0; a hostile
+        // authoritative server could answer differently at t1. This
+        // post-navigation recheck of the *final* URL is the mitigation — an
+        // attacker who flips DNS to an internal address gains nothing,
+        // because the landed URL is rejected here and the visit aborts with
+        // `navigation_error` before any content is recorded or interacted
+        // with. TTL-0 rebinding between the two checks remains theoretically
+        // possible and is accepted for v1; see SECURITY.md.
         if !early_termination
             && let Some(href) = final_url_raw.as_deref()
             && security::validate_redirect_target(href).await.is_err()

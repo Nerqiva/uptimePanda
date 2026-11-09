@@ -1,20 +1,32 @@
-//! Authentication (SEG-11; full hardening lands in SEG-13).
+//! Authentication (SEG-11; hardened in SEG-13).
 //!
 //! Session cookie `uptime_session`:
 //! `base64url(expiry_unix, 8-byte BE) ++ "." ++ hex(hmac_sha256(session_key, expiry_unix_bytes))`
 //! where `session_key = sha256(app_password || ":" || encryption_key)`.
 //!
-//! - 12h fixed TTL, HttpOnly, SameSite=Lax, Path=/, `Secure` when the
+//! - 12h TTL, HttpOnly, SameSite=Lax, Path=/, `Secure` when the
 //!   request arrives with `x-forwarded-proto: https` (we never terminate
 //!   TLS ourselves; without the header the cookie is not marked Secure so
 //!   plain-HTTP Flexible/local deployments keep working — set the header at
 //!   the proxy to get Secure).
+//! - **Sliding renewal**: an authenticated request whose session has less
+//!   than `RENEW_THRESHOLD_SECS` (6h, half the TTL) remaining gets a fresh
+//!   12h cookie appended to the response by `require_auth`. The cookie value
+//!   is self-contained, so renewal is one HMAC — no storage, no new cookie
+//!   name. The CSRF token is independent of the session expiry, so renewal
+//!   does not invalidate tokens embedded in already-rendered pages.
 //! - Constant-time password verification (both sides hashed to 32 bytes
 //!   first, then compared with a fold — no early exit).
 //! - Login rate limiting: 5 failed attempts inside a 60s sliding window
 //!   lock the source IP out for 60s (in-memory, per process). The lockout
 //!   message and the wrong-password message differ only after a lockout;
 //!   wrong-password copies are identical for all failures.
+//! - `X-Forwarded-For` is honored for rate limiting **only** when the
+//!   socket peer is loopback (the normal single-proxy deployment); from any
+//!   other peer the header is ignored, because otherwise a client could
+//!   spoof its lockout key with one header. The first (leftmost)
+//!   `X-Forwarded-For` entry is used, matching single-trusted-proxy
+//!   semantics; an unparseable header falls back to the peer IP.
 //! - CSRF for mutating routes lives in `web::csrf` (stateless double
 //!   submit); login is intentionally CSRF-exempt (pre-session, SameSite=Lax).
 
@@ -40,6 +52,8 @@ use crate::web::templates;
 
 const SESSION_COOKIE: &str = "uptime_session";
 const SESSION_TTL_SECS: i64 = 12 * 3600;
+/// Reissue the session cookie when less than this remains (half the TTL).
+pub(crate) const RENEW_THRESHOLD_SECS: i64 = 6 * 3600;
 const MAX_FAILS: usize = 5;
 const FAIL_WINDOW: Duration = Duration::from_secs(60);
 
@@ -221,9 +235,28 @@ pub(crate) fn clear_failures(ip: IpAddr) {
     guard.remove(&ip);
 }
 
-/// Client IP for rate limiting. Reads the [`ConnectInfo`] extension when
-/// the connection provides it (production), falls back to loopback in
-/// tests. Never fails extraction.
+/// Resolve the client IP for rate limiting.
+///
+/// `peer` is the socket peer address. `x_forwarded_for` is the raw
+/// `X-Forwarded-For` header, if present. The header is trusted **only**
+/// when the peer is loopback (single trusted proxy on the same host);
+/// otherwise it is ignored entirely. When trusted, the first (leftmost)
+/// entry is used — the address closest to the original client as seen by
+/// the proxy — and an unparseable value falls back to the peer.
+pub(crate) fn client_ip_from(peer: IpAddr, x_forwarded_for: Option<&str>) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+    let Some(raw) = x_forwarded_for else {
+        return peer;
+    };
+    raw.split(',')
+        .next()
+        .map(str::trim)
+        .and_then(|first| first.parse::<IpAddr>().ok())
+        .unwrap_or(peer)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ClientIp(pub IpAddr);
 
@@ -234,13 +267,17 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|ci| ci.0.ip())
-                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        ))
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let xff = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        Ok(Self(client_ip_from(peer, xff.as_deref())))
     }
 }
 
@@ -267,12 +304,16 @@ pub async fn require_auth(
     let Some(session) = authenticate(&state, &parts.headers) else {
         return Redirect::to("/login").into_response();
     };
+    // Renewal mints the cookie from the *original* request headers (only the
+    // `x-forwarded-proto` value matters, for the `Secure` attribute).
+    let headers_snapshot = parts.headers.clone();
 
     let mutating = !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS);
     if !mutating {
         let mut request = axum::extract::Request::from_parts(parts, body);
         request.extensions_mut().insert(session);
-        return next.run(request).await;
+        let response = next.run(request).await;
+        return maybe_append_renewed_cookie(&state, &headers_snapshot, session, response);
     }
 
     let headers = parts.headers.clone();
@@ -280,12 +321,7 @@ pub async fn require_auth(
         Ok(ok) => ok,
         Err(response) => return *response,
     };
-    if !crate::web::csrf::verify_request(
-        &state,
-        session.expiry_unix,
-        &headers,
-        form_token.as_deref(),
-    ) {
+    if !crate::web::csrf::verify_request(&state, &headers, form_token.as_deref()) {
         return crate::web::templates::error_page(
             StatusCode::FORBIDDEN,
             "403",
@@ -294,7 +330,26 @@ pub async fn require_auth(
     }
     let mut request = axum::extract::Request::from_parts(parts, body);
     request.extensions_mut().insert(session);
-    next.run(request).await
+    let response = next.run(request).await;
+    maybe_append_renewed_cookie(&state, &headers_snapshot, session, response)
+}
+
+/// Sliding session renewal: when less than [`RENEW_THRESHOLD_SECS`] of the
+/// session's TTL remains, append a fresh 12h `uptime_session` cookie to the
+/// response. No-op otherwise. Self-contained cookie — nothing stored.
+fn maybe_append_renewed_cookie(
+    state: &AppState,
+    original_headers: &HeaderMap,
+    session: SessionInfo,
+    response: Response,
+) -> Response {
+    if session.expiry_unix - now_unix() >= RENEW_THRESHOLD_SECS {
+        return response;
+    }
+    let (cookie, _expiry) = session_set_cookie(state, original_headers);
+    let mut response = response;
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+    response
 }
 
 /// Read a urlencoded form body (bounded) and extract the `csrf_token` field.
@@ -447,4 +502,62 @@ pub fn build_login_routes() -> axum::Router<SharedState> {
     axum::Router::new()
         .route("/login", axum::routing::get(login_page).post(login_submit))
         .route("/logout", axum::routing::post(logout))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xff_trusted_when_peer_is_loopback() {
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            client_ip_from(peer, Some("203.0.113.9")),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // First (leftmost) entry wins; later proxies append theirs.
+        assert_eq!(
+            client_ip_from(peer, Some("203.0.113.9, 10.0.0.1, 127.0.0.1")),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // Whitespace tolerated.
+        assert_eq!(
+            client_ip_from(peer, Some("  198.51.100.4 , 10.0.0.1")),
+            "198.51.100.4".parse::<IpAddr>().unwrap()
+        );
+        // IPv6 entry.
+        assert_eq!(
+            client_ip_from(peer, Some("2001:4860:4860::8888")),
+            "2001:4860:4860::8888".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn xff_ignored_when_peer_is_not_loopback() {
+        // A direct client cannot spoof its lockout key with a header.
+        let peer = "192.0.2.55".parse::<IpAddr>().unwrap();
+        assert_eq!(client_ip_from(peer, Some("203.0.113.9")), peer);
+        let peer6 = "2001:db8::1".parse::<IpAddr>().unwrap();
+        assert_eq!(client_ip_from(peer6, Some("203.0.113.9")), peer6);
+        let private_peer = "10.1.2.3".parse::<IpAddr>().unwrap();
+        assert_eq!(client_ip_from(private_peer, Some("8.8.8.8")), private_peer);
+    }
+
+    #[test]
+    fn xff_unparseable_falls_back_to_loopback_peer() {
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(client_ip_from(peer, Some("garbage")), peer);
+        assert_eq!(client_ip_from(peer, Some("")), peer);
+        assert_eq!(client_ip_from(peer, Some("a.b.c.d, 10.0.0.1")), peer);
+    }
+
+    #[test]
+    fn no_xff_header_yields_peer() {
+        let peer = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        assert_eq!(client_ip_from(peer, None), peer);
+    }
 }

@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod csrf;
+pub mod headers;
 pub mod routes;
 pub mod templates;
 pub mod views;

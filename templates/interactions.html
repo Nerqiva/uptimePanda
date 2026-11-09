@@ -63,43 +63,4 @@
     </div>
   </div>
 </div>
-<script>
-(function () {
-  "use strict";
-  var SNIPPETS = {
-    navigate: { type: "navigate", url: "https://example.com/" },
-    wait_duration: { type: "wait_duration", ms: 1500, jitter_pct: 20 },
-    wait_selector: { type: "wait_selector", selector: "main", timeout_ms: 8000 },
-    wait_js: { type: "wait_js", condition: "document.readyState === 'complete'", timeout_ms: 8000 },
-    scroll: { type: "scroll", direction: "vertical", distance_px: 600, operations: 3, delay_ms: 400 },
-    click: { type: "click", selector: "a.read-more", wait_after_ms: 1000 },
-    end_session: { type: "end_session" }
-  };
-  var ta = document.getElementById("interaction-json");
-  function parseCurrent() {
-    var raw = ta.value.trim();
-    if (!raw) return { actions: [], on_error: "abort" };
-    var seq = JSON.parse(raw);
-    if (!seq || typeof seq !== "object" || !Array.isArray(seq.actions)) {
-      throw new Error('expected {"actions": [...]} at the top level');
-    }
-    return seq;
-  }
-  function write(seq) { ta.value = JSON.stringify(seq, null, 2); }
-  document.getElementById("interaction-palette").addEventListener("click", function (event) {
-    var btn = event.target.closest("button[data-snippet]");
-    if (!btn) return;
-    try {
-      var seq = parseCurrent();
-      seq.actions.push(JSON.parse(JSON.stringify(SNIPPETS[btn.getAttribute("data-snippet")])));
-      write(seq);
-    } catch (err) {
-      window.appToast("Current JSON is invalid: " + err.message, "err");
-    }
-  });
-  document.getElementById("interaction-format").addEventListener("click", function () {
-    try { write(parseCurrent()); } catch (err) { window.appToast("Current JSON is invalid: " + err.message, "err"); }
-  });
-})();
-</script>
 {% endblock %}

@@ -8,6 +8,7 @@
 <link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
 <link rel="stylesheet" href="/public/styles.css">
 <script src="/public/htmx.min.js" defer></script>
+<script src="/public/app.js" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main-content">Skip to content</a>
@@ -55,150 +56,8 @@
 <h1 class="page-title">{{ chrome.title }}</h1>
 {% block content %}{% endblock %}
 </main>
+<footer class="app-footer">Monitor owned or authorized websites only.</footer>
 <div id="toast-region" class="toast-region" role="status" aria-live="polite"></div>
-<script>
-(function () {
-  "use strict";
-
-  // Toast auto-dismiss: MutationObserver catches server-sent (OOB) and
-  // locally created toasts alike.
-  var region = document.getElementById("toast-region");
-  function arm(el) {
-    window.setTimeout(function () { el.classList.remove("show"); }, 3600);
-    window.setTimeout(function () { el.remove(); }, 4000);
-  }
-  if (region) {
-    var mo = new MutationObserver(function (records) {
-      for (var i = 0; i < records.length; i++) {
-        var nodes = records[i].addedNodes;
-        for (var j = 0; j < nodes.length; j++) {
-          if (nodes[j].nodeType === 1) {
-            window.requestAnimationFrame(function (n) { return function () { n.classList.add("show"); }; }(nodes[j]));
-            arm(nodes[j]);
-          }
-        }
-      }
-    });
-    mo.observe(region, { childList: true });
-  }
-  window.appToast = function (message, kind) {
-    if (!region) return;
-    var el = document.createElement("div");
-    el.className = "toast " + (kind || "ok");
-    el.textContent = message;
-    region.appendChild(el);
-  };
-
-  // Busy state: flag submitting buttons while their request is in flight.
-  function actionButtons(elt) {
-    if (!elt || !elt.querySelectorAll) return [];
-    var trigger = elt.getAttribute && elt.getAttribute("hx-trigger");
-    if (trigger && trigger.indexOf("every") !== -1) return [];
-    if (elt.matches && elt.matches("button.btn")) return [elt];
-    return Array.prototype.slice.call(elt.querySelectorAll("button.btn"));
-  }
-  function mark(button, busy) {
-    button.disabled = busy;
-    button.classList.toggle("is-loading", busy);
-  }
-  document.body.addEventListener("htmx:before:request", function (event) {
-    var elt = event.detail && event.detail.ctx && event.detail.ctx.sourceElement;
-    actionButtons(elt).forEach(function (b) { mark(b, true); });
-  });
-  document.body.addEventListener("htmx:after:request", function (event) {
-    var elt = event.detail && event.detail.ctx && event.detail.ctx.sourceElement;
-    actionButtons(elt).forEach(function (b) { mark(b, false); });
-  });
-
-  // CSRF header backstop (hidden csrf_token form fields are the primary path).
-  document.body.addEventListener("htmx:config:request", function (event) {
-    var meta = document.querySelector('meta[name="csrf-token"]');
-    var ctx = event.detail && event.detail.ctx;
-    if (meta && meta.content && ctx && ctx.request && ctx.request.headers) {
-      ctx.request.headers["X-CSRF-Token"] = meta.content;
-    }
-  });
-
-  // Shared confirm modal for destructive actions. [data-confirm] buttons are
-  // intercepted in the capture phase so htmx never sees the original click.
-  var pendingConfirm = null;
-  function showModal(id) {
-    var overlay = document.getElementById(id);
-    if (!overlay) return;
-    overlay.hidden = false;
-    var first = overlay.querySelector("button");
-    if (first) first.focus();
-  }
-  function hideModals() {
-    var overlays = document.querySelectorAll(".modal-overlay");
-    for (var i = 0; i < overlays.length; i++) overlays[i].hidden = true;
-  }
-  window.appShowModal = showModal;
-  window.appHideModals = hideModals;
-
-  document.body.addEventListener("click", function (event) {
-    var open = event.target.closest("[data-modal-open]");
-    if (open) {
-      event.preventDefault();
-      showModal(open.getAttribute("data-modal-open"));
-      return;
-    }
-    if (event.target.closest("[data-modal-close]") || event.target.classList.contains("modal-overlay")) {
-      hideModals();
-      return;
-    }
-    var cfm = event.target.closest("[data-confirm]");
-    if (cfm && !cfm.hasAttribute("data-confirmed")) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      pendingConfirm = cfm;
-      var title = document.getElementById("confirm-modal-title");
-      var ok = document.getElementById("confirm-ok");
-      var parts = String(cfm.getAttribute("data-confirm") || "|").split("|");
-      if (title) title.textContent = parts[0] || "Confirm";
-      if (ok) ok.textContent = parts[1] || "Confirm";
-      showModal("confirm-modal");
-    }
-  }, true);
-
-  document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") hideModals();
-  });
-
-  document.body.addEventListener("click", function (event) {
-    if (event.target.id !== "confirm-ok") return;
-    if (!pendingConfirm) { hideModals(); return; }
-    var btn = pendingConfirm;
-    pendingConfirm = null;
-    btn.setAttribute("data-confirmed", "1");
-    hideModals();
-    btn.click();
-    btn.removeAttribute("data-confirmed");
-  });
-})();
-</script>
-<script>
-var railBtn = document.getElementById("rail-toggle");
-var railOverlay = document.getElementById("rail-overlay");
-var railBody = document.body;
-
-function setRail(open) {
-  railBody.classList.toggle("rail-open", open);
-  railBtn.setAttribute("aria-expanded", String(open));
-}
-
-var isMobile = window.matchMedia("(max-width: 719px)").matches;
-var stored = localStorage.getItem("rail-open");
-setRail(isMobile ? false : stored !== "0");
-
-railBtn.addEventListener("click", function () {
-  setRail(!railBody.classList.contains("rail-open"));
-  localStorage.setItem("rail-open", railBody.classList.contains("rail-open") ? "1" : "0");
-});
-railOverlay.addEventListener("click", function () {
-  setRail(false);
-});
-</script>
 <div class="modal-overlay" id="confirm-modal" hidden role="dialog" aria-modal="true" aria-label="Confirm">
   <div class="modal-card">
     <h2 class="modal-title" id="confirm-modal-title">Confirm</h2>

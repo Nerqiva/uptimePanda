@@ -51,27 +51,4 @@
     </form>
   </div>
 </div>
-<script>
-(function () {
-  "use strict";
-  var form = document.getElementById("profile-edit-form");
-  var forms = document.querySelectorAll("#profile-add-form, #profile-edit-form");
-  forms.forEach(function (f) {
-    f.addEventListener("submit", function () { window.appHideModals(); });
-  });
-  document.body.addEventListener("click", function (event) {
-    var btn = event.target.closest("[data-profile-id]");
-    if (!btn) return;
-    var id = btn.getAttribute("data-profile-id");
-    document.getElementById("profile-edit-name").value = btn.getAttribute("data-name") || "";
-    document.getElementById("profile-edit-description").value = btn.getAttribute("data-description") || "";
-    document.getElementById("profile-edit-preset").value = btn.getAttribute("data-ua-preset") || "";
-    document.getElementById("profile-edit-ua").value = btn.getAttribute("data-ua") || "";
-    document.getElementById("profile-edit-enabled").checked = btn.getAttribute("data-enabled") === "true";
-    var target = "/profiles/" + id;
-    form.setAttribute("hx-patch", target);
-    form.setAttribute("action", target);
-  });
-})();
-</script>
 {% endblock %}

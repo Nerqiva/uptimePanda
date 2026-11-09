@@ -27,11 +27,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
+    // SEG-13: startup self-check — the Lightpanda CDP server must bind
+    // 127.0.0.1. There is no environment/CLI path that overrides the host
+    // (BROWSER_BINARY swaps the binary, LIGHTPANDA_CDP_PORT swaps the port,
+    // serve_args pins the host); refuse to start if that ever regresses.
+    if !browser::manager::cdp_binds_loopback() {
+        tracing::error!("startup self-check failed: lightpanda CDP serve args must bind 127.0.0.1");
+        std::process::exit(1);
+    }
+
     let config = match config::Config::from_env() {
         Ok(c) => c,
         Err(msg) => {
             // Secrets are never printed; `msg` describes missing/invalid vars only.
-            eprintln!("{msg}");
+            tracing::error!("{msg}");
             std::process::exit(1);
         }
     };

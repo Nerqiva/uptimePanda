@@ -657,6 +657,72 @@ mod tests {
     }
 
     #[test]
+    fn redact_message_strips_url_fragments() {
+        let raw = "callback failed: https://example.com/cb#token=abc123&next=dashboard hit";
+        let out = redact_message(raw, 400);
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(!out.contains('#'), "{out}");
+        assert!(out.contains("https://example.com/cb"), "{out}");
+    }
+
+    #[test]
+    fn redact_message_strips_fragment_only_urls() {
+        let raw = "see https://example.com/page#session=deadbeef for details";
+        let out = redact_message(raw, 400);
+        assert!(!out.contains("deadbeef"), "{out}");
+        assert!(out.contains("https://example.com/page"), "{out}");
+    }
+
+    #[test]
+    fn redact_message_scrubs_every_redacted_key() {
+        // Every key in the scrub list must be neutralized, case-insensitively,
+        // with surrounding punctuation trimmed from the key name.
+        for key in REDACTED_ASSIGNMENT_KEYS {
+            for rendered in [key.to_string(), key.to_ascii_uppercase()] {
+                let raw = format!("failed with {rendered}=s3cret-value-0815 trailing");
+                let out = redact_message(&raw, 400);
+                assert!(!out.contains("s3cret-value-0815"), "key {rendered}: {out}");
+                assert!(out.contains("=[redacted]"), "key {rendered}: {out}");
+                assert!(out.contains("trailing"), "key {rendered}: {out}");
+            }
+        }
+        // Punctuation-wrapped keys still scrub.
+        let out = redact_message("bad (password)=hunter2 end", 400);
+        assert!(!out.contains("hunter2"), "{out}");
+        // Non-secret keys are left alone.
+        let out = redact_message("mode=basic count=2", 400);
+        assert!(out.contains("mode=basic"), "{out}");
+        assert!(out.contains("count=2"), "{out}");
+    }
+
+    #[test]
+    fn redact_message_non_url_input_passes_through() {
+        assert_eq!(
+            redact_message("plain error, nothing to hide", 400),
+            "plain error, nothing to hide"
+        );
+        assert_eq!(redact_message("", 400), "");
+        // A bare token with no `=` and no URL is untouched.
+        assert_eq!(
+            redact_message("saw token in traffic", 400),
+            "saw token in traffic"
+        );
+    }
+
+    #[test]
+    fn redact_message_caps_at_max_error_len() {
+        let raw = format!("https://example.com/{}", "a".repeat(5000));
+        // The URL-strip keeps the token, which is long; the cap must still win.
+        let out = redact_message(&raw, MAX_ERROR_MESSAGE_LEN);
+        assert!(out.chars().count() <= MAX_ERROR_MESSAGE_LEN);
+        assert_eq!(out.chars().count(), MAX_ERROR_MESSAGE_LEN);
+        assert!(out.ends_with('…'));
+        // And the same for non-URL noise.
+        let out = redact_message(&"x".repeat(5000), MAX_ERROR_MESSAGE_LEN);
+        assert_eq!(out.chars().count(), MAX_ERROR_MESSAGE_LEN);
+    }
+
+    #[test]
     fn redact_message_strips_url_queries() {
         let raw = "navigation failed: GET https://example.com/cb?token=abc123&id=7 failed";
         let out = redact_message(raw, 400);
