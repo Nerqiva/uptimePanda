@@ -48,6 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = db::Db::open(&config.database_path).await?;
     config::seed_settings(&db).await?;
+    // SEG-07: seed the two starter compatibility profiles (idempotent by
+    // name; existing rows untouched). No restart semantics.
+    let seeded = browser::sessions::seed_default_profiles(&db).await?;
+    if seeded > 0 {
+        tracing::info!(seeded, "seeded default compatibility profiles");
+    }
 
     // SEG-06: persistent Lightpanda process manager (recycle on >memory_restart_mb
     // RSS or crash only). Deeper wiring (scheduler/executor, System page) lands

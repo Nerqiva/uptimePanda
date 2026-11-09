@@ -45,6 +45,30 @@ fn website_from_row(row: &Row<'_>) -> rusqlite::Result<Website> {
     })
 }
 
+fn browser_profile_from_row(row: &Row<'_>) -> rusqlite::Result<BrowserProfile> {
+    Ok(BrowserProfile {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        description: row.get("description")?,
+        user_agent: row.get("user_agent")?,
+        enabled: row.get("enabled")?,
+        configuration_json: row.get("configuration_json")?,
+        created_at: parse_db_ts(&row.get::<_, String>("created_at")?, 6)?,
+        updated_at: parse_db_ts(&row.get::<_, String>("updated_at")?, 7)?,
+    })
+}
+
+fn cookie_record_from_row(row: &Row<'_>) -> rusqlite::Result<CookieRecord> {
+    Ok(CookieRecord {
+        id: row.get("id")?,
+        profile_id: row.get("profile_id")?,
+        domain: row.get("domain")?,
+        encrypted_cookie_data: row.get("encrypted_cookie_data")?,
+        expires_at: parse_db_ts_opt(row.get("expires_at")?, 4)?,
+        updated_at: parse_db_ts(&row.get::<_, String>("updated_at")?, 5)?,
+    })
+}
+
 fn scheduler_state_from_row(row: &Row<'_>) -> rusqlite::Result<SchedulerState> {
     Ok(SchedulerState {
         website_id: row.get("website_id")?,
@@ -76,6 +100,12 @@ fn visit_history_from_row(row: &Row<'_>) -> rusqlite::Result<VisitHistoryRow> {
 const WEBSITE_COLUMNS: &str = "id, name, url, enabled, profile_id, monitoring_mode, \
      min_interval_seconds, max_interval_seconds, min_session_seconds, max_session_seconds, \
      last_visit_at, next_visit_at, created_at, updated_at";
+
+const PROFILE_COLUMNS: &str = "id, name, description, user_agent, enabled, \
+    configuration_json, created_at, updated_at";
+
+const COOKIE_COLUMNS: &str = "id, profile_id, domain, encrypted_cookie_data, \
+    expires_at, updated_at";
 
 const VISIT_HISTORY_COLUMNS: &str = "id, website_id, profile_id, started_at, completed_at, \
      duration_ms, http_status, final_url, outcome, error_message, browser_pid, memory_usage";
@@ -477,5 +507,304 @@ impl Db {
             })
             .await?;
         Ok(id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// browser_profiles — CRUD (SEG-07)
+// ---------------------------------------------------------------------------
+
+/// Keep in sync with `browser::sessions::MAX_USER_AGENT_LEN`.
+const MAX_USER_AGENT_LEN: usize = 512;
+
+fn check_user_agent_len(ua: Option<&str>) -> Result<()> {
+    if let Some(ua) = ua
+        && ua.len() > MAX_USER_AGENT_LEN
+    {
+        return Err(super::DbError::Validation(format!(
+            "user_agent must be at most {MAX_USER_AGENT_LEN} bytes, got {}",
+            ua.len()
+        )));
+    }
+    Ok(())
+}
+
+impl Db {
+    /// Insert a browser profile. The `id` on the input is ignored; the
+    /// `AUTOINCREMENT` id is returned. `user_agent` longer than
+    /// [`MAX_USER_AGENT_LEN`] bytes is rejected with [`super::DbError::Validation`].
+    pub async fn create_profile(&self, profile: &BrowserProfile) -> Result<i64> {
+        check_user_agent_len(profile.user_agent.as_deref())?;
+        let profile = profile.clone();
+        let created_at = format_db_ts(profile.created_at)?;
+        let updated_at = format_db_ts(profile.updated_at)?;
+        let id = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO browser_profiles
+                        (name, description, user_agent, enabled,
+                         configuration_json, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        profile.name,
+                        profile.description,
+                        profile.user_agent,
+                        profile.enabled,
+                        profile.configuration_json,
+                        created_at,
+                        updated_at,
+                    ],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await?;
+        Ok(id)
+    }
+
+    /// Fetch a single profile by id.
+    pub async fn profile_by_id(&self, id: i64) -> Result<Option<BrowserProfile>> {
+        let row = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Option<BrowserProfile>> {
+                c.query_row(
+                    &format!("SELECT {PROFILE_COLUMNS} FROM browser_profiles WHERE id = ?1"),
+                    params![id],
+                    browser_profile_from_row,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// Fetch a single profile by its unique name.
+    pub async fn profile_by_name(&self, name: &str) -> Result<Option<BrowserProfile>> {
+        let name = name.to_owned();
+        let row = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Option<BrowserProfile>> {
+                c.query_row(
+                    &format!("SELECT {PROFILE_COLUMNS} FROM browser_profiles WHERE name = ?1"),
+                    params![name],
+                    browser_profile_from_row,
+                )
+                .optional()
+            })
+            .await?;
+        Ok(row)
+    }
+
+    /// All profiles, ordered by id.
+    pub async fn list_profiles(&self) -> Result<Vec<BrowserProfile>> {
+        let rows = self
+            .connection()
+            .call(|c| -> rusqlite::Result<Vec<BrowserProfile>> {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {PROFILE_COLUMNS} FROM browser_profiles ORDER BY id"
+                ))?;
+                let profiles = stmt
+                    .query_map([], browser_profile_from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(profiles)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Update a profile. `updated_at` is always set to now by this function.
+    /// Returns `true` when a row was actually updated.
+    pub async fn update_profile(&self, profile: &BrowserProfile) -> Result<bool> {
+        check_user_agent_len(profile.user_agent.as_deref())?;
+        let profile = profile.clone();
+        let updated_at = format_db_ts(OffsetDateTime::now_utc())?;
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "UPDATE browser_profiles SET
+                        name = ?2, description = ?3, user_agent = ?4,
+                        enabled = ?5, configuration_json = ?6, updated_at = ?7
+                     WHERE id = ?1",
+                    params![
+                        profile.id,
+                        profile.name,
+                        profile.description,
+                        profile.user_agent,
+                        profile.enabled,
+                        profile.configuration_json,
+                        updated_at,
+                    ],
+                )
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Enable or disable a profile without touching any other column.
+    /// Returns `true` when a row was actually updated.
+    pub async fn set_profile_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
+        let updated_at = format_db_ts(OffsetDateTime::now_utc())?;
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "UPDATE browser_profiles SET enabled = ?2, updated_at = ?3
+                     WHERE id = ?1",
+                    params![id, enabled, updated_at],
+                )
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Delete a profile. Its `cookies` rows cascade (`ON DELETE CASCADE`);
+    /// websites that referenced it keep their configuration with
+    /// `profile_id` set to NULL (`ON DELETE SET NULL`). Returns `true` when
+    /// a row was actually deleted.
+    pub async fn delete_profile(&self, id: i64) -> Result<bool> {
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute("DELETE FROM browser_profiles WHERE id = ?1", params![id])
+            })
+            .await?;
+        Ok(affected > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cookies — encrypted jar rows, one per (profile_id, domain) (SEG-07)
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Insert or replace the cookie jar row for `(profile_id, domain)`.
+    /// Returns the row id. `expires_at` is `MAX(per-cookie expiry)` —
+    /// `None` when any cookie in the jar is a session cookie.
+    pub async fn upsert_cookie_jar(
+        &self,
+        profile_id: i64,
+        domain: &str,
+        encrypted_cookie_data: &str,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<i64> {
+        let domain = domain.to_owned();
+        let data = encrypted_cookie_data.to_owned();
+        let expires_at = expires_at.map(format_db_ts).transpose()?;
+        let id = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO cookies
+                        (profile_id, domain, encrypted_cookie_data, expires_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                     ON CONFLICT(profile_id, domain) DO UPDATE SET
+                        encrypted_cookie_data = excluded.encrypted_cookie_data,
+                        expires_at = excluded.expires_at,
+                        updated_at = excluded.updated_at",
+                    params![profile_id, domain, data, expires_at],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await?;
+        Ok(id)
+    }
+
+    /// All jars for a profile, ordered by domain.
+    pub async fn list_cookie_jars(&self, profile_id: i64) -> Result<Vec<CookieRecord>> {
+        let rows = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<Vec<CookieRecord>> {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT {COOKIE_COLUMNS} FROM cookies WHERE profile_id = ?1 ORDER BY domain"
+                ))?;
+                let jars = stmt
+                    .query_map(params![profile_id], cookie_record_from_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(jars)
+            })
+            .await?;
+        Ok(rows)
+    }
+
+    /// Atomically replace the whole jar set of a profile: every existing
+    /// `(profile_id, domain)` row is deleted, then the provided
+    /// `(domain, data, expires_at)` tuples are inserted — in one transaction.
+    /// This is the "live jar wins" policy (see `browser::sessions`).
+    /// Returns the number of rows inserted.
+    pub async fn replace_profile_cookies(
+        &self,
+        profile_id: i64,
+        jars: Vec<(String, String, Option<OffsetDateTime>)>,
+    ) -> Result<u64> {
+        let jars = jars
+            .into_iter()
+            .map(|(domain, data, expires_at)| {
+                Ok::<_, crate::db::DbError>((
+                    domain,
+                    data,
+                    expires_at.map(format_db_ts).transpose()?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inserted = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "DELETE FROM cookies WHERE profile_id = ?1",
+                    params![profile_id],
+                )?;
+                let mut n = 0usize;
+                {
+                    let mut stmt = tx.prepare(
+                        "INSERT INTO cookies
+                            (profile_id, domain, encrypted_cookie_data, expires_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                    )?;
+                    for (domain, data, expires_at) in &jars {
+                        stmt.execute(params![profile_id, domain, data, expires_at])?;
+                        n += 1;
+                    }
+                }
+                tx.commit()?;
+                Ok(n)
+            })
+            .await?;
+        Ok(inserted as u64)
+    }
+
+    /// Delete every cookie jar of a profile. Returns rows deleted.
+    pub async fn delete_profile_cookies(&self, profile_id: i64) -> Result<u64> {
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "DELETE FROM cookies WHERE profile_id = ?1",
+                    params![profile_id],
+                )
+            })
+            .await?;
+        Ok(affected as u64)
+    }
+
+    /// Delete the cookie jar for one `(profile_id, domain)`. Returns
+    /// `true` when a row was deleted.
+    pub async fn delete_profile_cookies_for_domain(
+        &self,
+        profile_id: i64,
+        domain: &str,
+    ) -> Result<u64> {
+        let domain = domain.to_owned();
+        let affected = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "DELETE FROM cookies WHERE profile_id = ?1 AND domain = ?2",
+                    params![profile_id, domain],
+                )
+            })
+            .await?;
+        Ok(affected as u64)
     }
 }

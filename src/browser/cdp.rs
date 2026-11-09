@@ -698,15 +698,11 @@ impl CdpHandle {
             let _ = self.close_target(&session.target_id).await;
             return Err(e);
         }
-        if let Some(ua) = ua {
-            // NOTE: verified no-op on Lightpanda 1.0.3; sent for forward compat.
-            debug!("ua override sent (compat; engine may ignore)");
-            if let Err(e) = session
-                .call("Network.setUserAgentOverride", json!({ "userAgent": ua }))
-                .await
-            {
-                debug!(error = %e, "ua override command failed; continuing without it");
-            }
+        if let Some(ua) = ua
+            && let Err(e) = session.set_user_agent_override(ua).await
+        {
+            // The override is a no-op on 1.0.3 anyway; UA must never fail a visit.
+            debug!(error = %e, "ua override command failed; continuing without it");
         }
         Ok(session)
     }
@@ -956,6 +952,25 @@ impl PageSession {
                 }
             }
         }
+    }
+
+    /// Send `Network.setUserAgentOverride` for this page's session.
+    ///
+    /// **Verified no-op on Lightpanda 1.0.3**: the command returns `{}`
+    /// but the UA on the wire and in JS does not change (see
+    /// `docs/phase0-validation.md` §5). The command is sent anyway for
+    /// forward compatibility and logs a single debug line. The wire result
+    /// is returned verbatim; callers that consider the override best-effort
+    /// (open-time wiring, `apply_identity`) log and swallow errors.
+    ///
+    /// Callers must not rely on the override (SEG-07 emits the same label
+    /// everywhere a preset is shown).
+    pub async fn set_user_agent_override(&self, ua: &str) -> Result<(), CdpError> {
+        // NOTE: verified no-op on Lightpanda 1.0.3; sent for forward compat.
+        debug!("ua override sent (compat; engine may ignore)");
+        self.call("Network.setUserAgentOverride", json!({ "userAgent": ua }))
+            .await?;
+        Ok(())
     }
 
     /// `Network.getCookies` with **no** `urls` filter: returns every cookie
