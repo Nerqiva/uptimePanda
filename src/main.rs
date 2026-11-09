@@ -54,6 +54,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db = db::Db::open(&config.database_path).await?;
+    // SEG-15: 512 MB budget self-check. Always log app RSS; warn
+    // `tight_memory` when MemAvailable is low (the app still runs).
+    if let Some(rss) = resources::app_rss_mb() {
+        tracing::info!(app_rss_mb = rss, "app memory at boot");
+    }
+    match (resources::sys_total_mb(), resources::mem_available_mb()) {
+        (Some(total_mb), Some(avail_mb)) => {
+            if resources::tight_budget(total_mb, avail_mb) {
+                tracing::warn!(
+                    total_mb,
+                    avail_mb,
+                    "tight_memory budget: MemAvailable < 350 MB at boot; continuing anyway"
+                );
+            } else {
+                tracing::info!(total_mb, avail_mb, "memory budget check ok");
+            }
+        }
+        _ => tracing::warn!("memory budget self-check unavailable (/proc/meminfo unreadable)"),
+    }
     config::seed_settings(&db).await?;
     // SEG-07: seed the two starter compatibility profiles (idempotent by
     // name; existing rows untouched). No restart semantics.
@@ -122,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let join =
                     tokio::spawn(async move { exec_for_job.execute(website_id, trigger).await });
                 match join.await {
-                    Ok(outcome) => {
+                    Ok(Ok(outcome)) => {
                         tracing::info!(
                             website_id,
                             outcome = ?outcome.outcome,
@@ -141,6 +160,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             tracing::error!(website_id, error = %e,
                                 "failed to report scheduler completion");
+                        }
+                    }
+                    // Pre-flight memory guard refused the visit before any
+                    // work started. Map to a retryable `timeout` completion
+                    // (the scheduler owns backoff); no `visit_history` row
+                    // exists, which is the point.
+                    Ok(Err(executor::ExecutorError::ResourceGuard)) => {
+                        tracing::warn!(
+                            website_id,
+                            "visit refused by memory guard; reporting timeout for scheduler backoff"
+                        );
+                        if let Err(e) = sched_for_loop
+                            .handle_completion(website_id, db::Outcome::Timeout)
+                            .await
+                        {
+                            tracing::error!(website_id, error = %e,
+                                "failed to report scheduler completion after memory-guard refusal");
                         }
                     }
                     Err(join_err) => {
@@ -172,12 +208,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 match config::typed_i64(&db, "history_retention_days").await {
                     Ok(days) => match db.cleanup_expired_history(days).await {
-                        Ok(stats) => tracing::info!(
-                            retention_days = days,
-                            visit_history_deleted = stats.visit_history_deleted,
-                            browser_events_deleted = stats.browser_events_deleted,
-                            "retention pass complete"
-                        ),
+                        Ok(stats) => {
+                            tracing::info!(
+                                retention_days = days,
+                                visit_history_deleted = stats.visit_history_deleted,
+                                browser_events_deleted = stats.browser_events_deleted,
+                                "retention pass complete"
+                            );
+                            // SEG-15: advisory db_size_warn_mb enforcement —
+                            // runs on the boot pass and every 24h pass.
+                            resources::enforce_db_size_warn(&db).await;
+                        }
                         Err(e) => {
                             tracing::error!(error = %e, "retention pass failed")
                         }

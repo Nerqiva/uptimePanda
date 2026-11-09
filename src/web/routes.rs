@@ -258,7 +258,6 @@ async fn public_file(Path(path): Path<String>) -> Response {
 
 struct BrowserSummary {
     running: bool,
-    pid: Option<u32>,
     sub: String,
     rss_mb_label: String,
     rss_mb: f64,
@@ -284,7 +283,6 @@ fn browser_summary(state: &AppState) -> BrowserSummary {
             };
             BrowserSummary {
                 running: s.running,
-                pid: s.pid,
                 sub,
                 rss_mb_label: format!("{:.1}", s.rss_mb),
                 rss_mb: s.rss_mb,
@@ -296,7 +294,6 @@ fn browser_summary(state: &AppState) -> BrowserSummary {
         }
         None => BrowserSummary {
             running: false,
-            pid: None,
             sub: "lightpanda unavailable (browser features disabled)".to_string(),
             rss_mb_label: "0.0".to_string(),
             rss_mb: 0.0,
@@ -385,39 +382,20 @@ async fn overview_fragment(
 // System
 // ---------------------------------------------------------------------------
 
-fn mem_available_mb() -> Option<u64> {
-    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
-    raw.lines().find_map(|line| {
-        line.strip_prefix("MemAvailable:").and_then(|v| {
-            v.trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .map(|kb| kb / 1024)
-        })
-    })
-}
-
-fn db_size_mb(state: &AppState) -> Option<f64> {
-    let mut total = std::fs::metadata(&state.database_path).ok()?.len();
-    for suffix in ["-wal", "-shm"] {
-        let mut name = state.database_path.as_os_str().to_owned();
-        name.push(suffix);
-        if let Ok(meta) = std::fs::metadata(std::path::PathBuf::from(name)) {
-            total += meta.len();
-        }
-    }
-    Some(total as f64 / (1024.0 * 1024.0))
-}
-
 async fn collect_system_stats(state: &AppState) -> Result<SystemStatsView, AppError> {
     let browser = browser_summary(state);
-    let queue_len = state
-        .scheduler
-        .as_ref()
-        .map(|s| s.queue_length())
-        .unwrap_or(0);
+    let snap = crate::resources::ResourceSnapshot::collect(
+        &state.db,
+        state.manager.as_deref(),
+        state.scheduler.as_ref(),
+    )
+    .await;
+    let tight_budget = crate::resources::tight_budget(snap.mem_total_mb, snap.mem_available_mb);
+    let db_warn_mb = crate::config::typed_i64(&state.db, "db_size_warn_mb")
+        .await
+        .unwrap_or(64);
+    let db_over_warn = snap.db_size_mb > db_warn_mb as f64;
+    let queue_len = snap.queue_length;
     let next_visit = match state.db.next_scheduled_visit_at().await? {
         Some(t) => format!("next visit {}", ts(&t)),
         None => "no scheduled visits".to_string(),
@@ -441,12 +419,16 @@ async fn collect_system_stats(state: &AppState) -> Result<SystemStatsView, AppEr
         restarts_total: browser.restarts_total,
         queue_len,
         next_visit,
-        db_size_mb: db_size_mb(state)
-            .map(|mb| format!("{mb:.1}"))
-            .unwrap_or_else(|| "—".to_string()),
-        mem_available_mb: mem_available_mb()
-            .map(|mb| mb.to_string())
-            .unwrap_or_else(|| "—".to_string()),
+        db_size_mb: format!("{:.1}", snap.db_size_mb),
+        mem_available_mb: if snap.mem_available_mb > 0 {
+            snap.mem_available_mb.to_string()
+        } else {
+            "—".to_string()
+        },
+        app_rss_mb: snap.app_rss_mb.to_string(),
+        tight_budget,
+        db_over_warn,
+        db_warn_mb,
     })
 }
 
@@ -467,7 +449,7 @@ async fn system_page(
             event_type: ev.event_type.clone(),
             warn: matches!(
                 ev.event_type.as_str(),
-                "health_warn" | "crashed" | "crash_loop" | "respawn_failed"
+                "health_warn" | "crashed" | "crash_loop" | "respawn_failed" | "db_size_warn"
             ),
             memory_label: ev
                 .memory_usage
@@ -538,19 +520,49 @@ pub struct CsrfOnlyForm {
 
 async fn api_system(State(state): State<SharedState>, session: Extension<SessionInfo>) -> Response {
     let _ = session;
-    let browser = browser_summary(&state);
-    let present = state.manager.is_some();
+    let snap = crate::resources::ResourceSnapshot::collect(
+        &state.db,
+        state.manager.as_deref(),
+        state.scheduler.as_ref(),
+    )
+    .await;
+    let tight_budget = crate::resources::tight_budget(snap.mem_total_mb, snap.mem_available_mb);
+    let (
+        browser_running,
+        lightpanda_rss_mb,
+        lightpanda_cpu_pct,
+        browser_pid,
+        browser_uptime_s,
+        browser_restarts_total,
+    ) = match &snap.lightpanda {
+        Some(s) => (
+            s.running,
+            s.rss_mb,
+            s.cpu_pct,
+            s.pid.unwrap_or(0) as u64,
+            s.uptime_s,
+            s.restarts_total,
+        ),
+        None => (false, 0.0, 0.0, 0, 0, 0),
+    };
+    // SEG-15: every numeric value is a JSON number (0 = unavailable); the
+    // browser-absent case is reported by `browser_running: false` and zeros.
     let payload = serde_json::json!({
         "app_version": state.version.trim(),
-        "browser_running": browser.running,
-        "lightpanda_rss_mb": if present { Some(browser.rss_mb) } else { None },
-        "lightpanda_cpu_pct": if present { Some(browser.cpu_pct) } else { None },
-        "browser_pid": browser.pid,
-        "browser_uptime_s": if present { Some(browser.uptime_s) } else { None },
-        "browser_restarts_total": if present { Some(browser.restarts_total) } else { None },
-        "queue_length": state.scheduler.as_ref().map(|s| s.queue_length()).unwrap_or(0),
-        "db_size_mb": db_size_mb(&state),
-        "mem_available_mb": mem_available_mb(),
+        "version": state.version.trim(),
+        "browser_running": browser_running,
+        "lightpanda_rss_mb": lightpanda_rss_mb,
+        "lightpanda_cpu_pct": lightpanda_cpu_pct,
+        "browser_pid": browser_pid,
+        "browser_uptime_s": browser_uptime_s,
+        "browser_restarts_total": browser_restarts_total,
+        "queue_length": snap.queue_length,
+        "db_size_mb": snap.db_size_mb,
+        "mem_available_mb": snap.mem_available_mb,
+        "mem_total_mb": snap.mem_total_mb,
+        "app_rss_mb": snap.app_rss_mb,
+        "tight_budget": tight_budget,
+        "uptime_s": state.boot_instant.elapsed().as_secs(),
     });
     axum::Json(payload).into_response()
 }
@@ -2025,7 +2037,7 @@ const SETTING_GROUPS: &[(&str, &str, &str, &[&str])] = &[
     ),
     (
         "History & database",
-        "Retention and storage guards. history_retention_days is enforced by the retention pass (on boot, then every 24h). db_size_warn_mb is stored for a dashboard warning; advisory enforcement lands with SEG-15/16.",
+        "Retention and storage guards. history_retention_days is enforced by the retention pass (on boot, then every 24h). db_size_warn_mb is enforced there too: an over-threshold database logs a warning and records a db_size_warn browser_events row, and the System page shows a badge.",
         "history-database",
         &[
             "history_retention_days",
@@ -2597,6 +2609,63 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(String::from_utf8(body).unwrap().contains("Overview"));
+    }
+
+    #[tokio::test]
+    async fn api_system_json_has_expected_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        let (status, _h, body) = request(
+            app,
+            "GET",
+            "/api/system",
+            &[("cookie", cookie.as_str())],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("system json");
+        for key in [
+            "app_version",
+            "version",
+            "browser_running",
+            "lightpanda_rss_mb",
+            "lightpanda_cpu_pct",
+            "browser_pid",
+            "browser_uptime_s",
+            "browser_restarts_total",
+            "queue_length",
+            "db_size_mb",
+            "mem_available_mb",
+            "mem_total_mb",
+            "app_rss_mb",
+            "tight_budget",
+            "uptime_s",
+        ] {
+            assert!(json.get(key).is_some(), "missing key {key} in {json}");
+        }
+        assert!(json["version"].is_string());
+        assert!(json["app_version"].is_string());
+        assert_eq!(json["version"], json["app_version"]);
+        assert!(json["browser_running"].is_boolean());
+        assert!(json["tight_budget"].is_boolean());
+        for key in [
+            "lightpanda_rss_mb",
+            "lightpanda_cpu_pct",
+            "browser_pid",
+            "browser_uptime_s",
+            "browser_restarts_total",
+            "queue_length",
+            "db_size_mb",
+            "mem_available_mb",
+            "mem_total_mb",
+            "app_rss_mb",
+            "uptime_s",
+        ] {
+            assert!(json[key].is_number(), "{key} must be a JSON number: {json}");
+        }
     }
 
     // --- CSRF + mutations ---

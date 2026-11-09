@@ -5,6 +5,8 @@
     <span class="chip">v{{ chrome.version }}</span>
     <a class="chip" href="/api/system">/api/system (raw JSON)</a>
     {% if !browser_available %}<span class="pill err">lightpanda unavailable</span>{% endif %}
+    {% if stats.tight_budget %}<span class="pill warn">tight memory (&lt;350 MB available)</span>{% endif %}
+    {% if stats.db_over_warn %}<span class="pill warn">db over {{ stats.db_warn_mb }} MB</span>{% endif %}
   </div>
   <div id="system-stats" hx-get="/fragments/system" hx-trigger="load, every 3s" hx-swap="innerHTML">
     {% include "partials/system_stats.html" %}

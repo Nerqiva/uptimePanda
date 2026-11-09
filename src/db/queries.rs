@@ -1495,3 +1495,25 @@ impl Db {
         Ok(n)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Database size — pragma-based measurement (SEG-15).
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Size of the SQLite main database file in MB, computed as
+    /// `PRAGMA page_count * PRAGMA page_size`. Excludes the `-wal` file
+    /// (which `PRAGMA wal_checkpoint(TRUNCATE)` shrinks during the retention
+    /// pass anyway); `0.0` for an empty or in-memory database is fine.
+    pub async fn db_size_mb(&self) -> Result<f64> {
+        let bytes = self
+            .connection()
+            .call(|c| -> rusqlite::Result<u64> {
+                let page_count: i64 = c.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                let page_size: i64 = c.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                Ok((page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64))
+            })
+            .await?;
+        Ok(bytes as f64 / (1024.0 * 1024.0))
+    }
+}

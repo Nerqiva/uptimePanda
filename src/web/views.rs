@@ -330,6 +330,13 @@ pub struct SystemStatsView {
     pub next_visit: String,
     pub db_size_mb: String,
     pub mem_available_mb: String,
+    /// This process's RSS (`/proc/self/status`), MB.
+    pub app_rss_mb: String,
+    /// MemAvailable < 350 MB — drives the tight-budget badge.
+    pub tight_budget: bool,
+    /// `db_size_mb` exceeds the `db_size_warn_mb` setting — drives the badge.
+    pub db_over_warn: bool,
+    pub db_warn_mb: i64,
 }
 
 #[derive(Template)]

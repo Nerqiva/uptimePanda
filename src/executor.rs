@@ -3,6 +3,11 @@
 //!
 //! One `execute()` call performs exactly one visit:
 //!
+//!  0. **pre-flight memory guard** — when `MemAvailable` (`/proc/meminfo`)
+//!     is below [`crate::resources::RESOURCE_GUARD_MIN_AVAILABLE_MB`] the
+//!     visit is refused *before* the gate is taken: no `visit_history` row
+//!     is written, no browser work starts. The caller maps the refusal to a
+//!     retryable `timeout` scheduler completion (the scheduler owns backoff);
 //!  1. loads the website (unknown id → `NavigationError` outcome, nothing
 //!     recorded — `visit_history.website_id` is a foreign key);
 //!  2. loads the browser profile when `websites.profile_id` is set. A profile
@@ -12,7 +17,9 @@
 //!  3. acquires the manager's `visit_gate` for the **entire** visit — before
 //!     `ensure_running()` — so a recycle can never SIGTERM the browser
 //!     mid-visit. Released on every return path because the guard is bound
-//!     in `execute`'s scope;
+//!     in `execute`'s scope; (with one exception: a pre-flight memory-guard
+//!     refusal returns `Err` *before* the gate is taken — nothing else is
+//!     touched);
 //!  4. ensures Lightpanda is running (`ensure_running`, ≤30 s). Failure →
 //!     `BrowserCrash` outcome, recorded; no retry here (the scheduler owns
 //!     the retry matrix);
@@ -88,6 +95,33 @@ pub enum ExecutionTrigger {
     Scheduled,
     Manual,
 }
+
+/// Why a visit never started.
+///
+/// Distinct from `Outcome`: a guard refusal is **not** a visit and never
+/// produces a `visit_history` row. The caller maps this onto a retryable
+/// scheduler completion (see the job loop in `main.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutorError {
+    /// `MemAvailable` is below
+    /// [`crate::resources::RESOURCE_GUARD_MIN_AVAILABLE_MB`]. Transient —
+    /// the scheduler retries with backoff.
+    ResourceGuard,
+}
+
+impl std::fmt::Display for ExecutorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutorError::ResourceGuard => write!(
+                f,
+                "insufficient available memory (MemAvailable < {} MB)",
+                crate::resources::RESOURCE_GUARD_MIN_AVAILABLE_MB
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
 
 /// Outcome of one executed visit. The caller (the job loop in `main.rs`)
 /// maps this onto
@@ -234,10 +268,28 @@ impl Executor {
         }
     }
 
-    /// Execute one visit. Never panics on the normal path and never
-    /// returns `Err` — every failure mode is recorded as an outcome
-    /// (unknown-website, which FK-prevents a row, excepted).
-    pub async fn execute(&self, website_id: i64, trigger: ExecutionTrigger) -> VisitOutcome {
+    /// Execute one visit. Never panics on the normal path.
+    ///
+    /// Returns `Err(ExecutorError::ResourceGuard)` when `MemAvailable` is
+    /// below the pre-flight floor — before the gate is taken, before any
+    /// browser work, before `visit_history` is touched. Every other failure
+    /// mode is a recorded `Outcome` (unknown-website, which FK-prevents a
+    /// row, excepted).
+    pub async fn execute(
+        &self,
+        website_id: i64,
+        trigger: ExecutionTrigger,
+    ) -> Result<VisitOutcome, ExecutorError> {
+        // 0) Pre-flight memory guard — BEFORE the gate, before any work.
+        //    A refusal leaves no trace in `visit_history` by design; the
+        //    caller maps it to a retryable timeout completion.
+        if let Some(avail) = crate::resources::mem_available_mb()
+            && crate::resources::should_refuse(avail)
+        {
+            tracing::warn!(avail_mb = avail, "visit refused: memory guard");
+            return Err(ExecutorError::ResourceGuard);
+        }
+
         // Hold the visit gate for the ENTIRE visit — from before
         // ensure_running until the target is closed. Released on every
         // return path because the guard is bound in this function scope.
@@ -246,7 +298,7 @@ impl Executor {
 
         let span = info_span!("visit", website_id, trigger = ?trigger);
         let _enter = span.enter();
-        self.execute_inner(website_id, trigger).await
+        Ok(self.execute_inner(website_id, trigger).await)
     }
 
     async fn execute_inner(&self, website_id: i64, trigger: ExecutionTrigger) -> VisitOutcome {
@@ -1244,7 +1296,10 @@ mod tests {
             key.to_string(),
             test_config(key),
         );
-        let outcome = executor.execute(id, ExecutionTrigger::Scheduled).await;
+        let outcome = executor
+            .execute(id, ExecutionTrigger::Scheduled)
+            .await
+            .expect("memory guard allows the visit");
         eprintln!(
             "live visit outcome: {:?} in {:?}",
             outcome.outcome, outcome.duration
@@ -1316,7 +1371,10 @@ mod tests {
             key.to_string(),
             test_config(key),
         );
-        let outcome = executor.execute(id, ExecutionTrigger::Scheduled).await;
+        let outcome = executor
+            .execute(id, ExecutionTrigger::Scheduled)
+            .await
+            .expect("memory guard allows the visit");
         eprintln!("live profile visit outcome: {:?}", outcome.outcome);
 
         let jars = db.list_cookie_jars(profile_id).await.expect("list jars");
@@ -1388,7 +1446,8 @@ mod tests {
         );
         let outcome = executor
             .execute(job.website_id, ExecutionTrigger::Manual)
-            .await;
+            .await
+            .expect("memory guard allows the visit");
         eprintln!("manual visit outcome: {:?}", outcome.outcome);
         sched
             .handle_completion(job.website_id, completion_outcome(outcome.outcome))

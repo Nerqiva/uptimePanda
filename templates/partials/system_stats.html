@@ -1,3 +1,5 @@
+{% if stats.tight_budget %}<p class="note warn">Tight memory budget — MemAvailable is below 350 MB. New visits may be refused to protect the host until memory frees up.</p>{% endif %}
+{% if stats.db_over_warn %}<p class="note err">Database size {{ stats.db_size_mb }} MB exceeds the db_size_warn_mb threshold ({{ stats.db_warn_mb }} MB). Run a backup, then consider pruning history.</p>{% endif %}
 <div class="stat-grid">
   <div class="stat-card{% if stats.browser_running %} ok{% endif %}">
     <span class="stat-label">Browser</span>
@@ -31,12 +33,17 @@
   </div>
   <div class="stat-card">
     <span class="stat-label">Database size</span>
-    <span class="stat-value">{{ stats.db_size_mb }}</span>
-    <span class="stat-sub">MB (main + WAL)</span>
+    <span class="stat-value">{{ stats.db_size_mb }}{% if stats.db_over_warn %} <span class="pill warn">over {{ stats.db_warn_mb }} MB</span>{% endif %}</span>
+    <span class="stat-sub">MB (SQLite, page_count × page_size)</span>
   </div>
   <div class="stat-card">
     <span class="stat-label">Memory available</span>
-    <span class="stat-value">{{ stats.mem_available_mb }}</span>
+    <span class="stat-value">{{ stats.mem_available_mb }}{% if stats.tight_budget %} <span class="pill warn">tight</span>{% endif %}</span>
     <span class="stat-sub">MB (host, /proc/meminfo)</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-label">App RSS</span>
+    <span class="stat-value">{{ stats.app_rss_mb }}</span>
+    <span class="stat-sub">MB (this process, /proc/self/status)</span>
   </div>
 </div>

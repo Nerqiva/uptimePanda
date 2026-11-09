@@ -1005,6 +1005,9 @@ textarea {
 .note.err {
   color: var(--err);
 }
+.note.warn {
+  color: var(--warn);
+}
 
 /* ---- edit-in-place settings ---- */
 .setting {

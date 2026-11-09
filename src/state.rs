@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::browser::manager::BrowserManager;
 use crate::config::Config;
@@ -30,6 +31,9 @@ pub struct AppState {
     pub database_path: PathBuf,
     pub backup_dir: PathBuf,
     pub version: &'static str,
+    /// Process boot, stamped at construction — powers `uptime_s` in
+    /// `/api/system`.
+    pub boot_instant: Instant,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -57,6 +61,7 @@ impl AppState {
             database_path: config.database_path.clone(),
             backup_dir: config.backup_dir.clone(),
             version,
+            boot_instant: Instant::now(),
         }
     }
 }
