@@ -1,0 +1,36 @@
+[package]
+name = "uptimepanda"
+version = "2026.11.9-alpha.1" # SemVer projection of CalVer 2026.11.09.1-alpha (Cargo requires SemVer; projection is monotonic with the CalVer ordering)
+edition = "2024"
+
+[dependencies]
+aes-gcm = "0.11.1"
+askama = "0.16.1"
+axum = "0.8.9"
+base64 = "0.23.1"
+futures-util = "0.3.34"
+hex = "0.4.3"
+hmac = "0.13.0"
+once_cell = "1.21.4"
+rand = "0.10.3"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+scrypt = "0.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-rusqlite = "0.8.0"
+tokio-tungstenite = "0.30.0"
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+
+[profile.release]
+# debug = false, lto = "thin", codegen-units = 1: keep release builds lean and
+# optimized without binary-size heroics; the binding constraint is RAM, not bytes.
+debug = false
+lto = "thin"
+codegen-units = 1
