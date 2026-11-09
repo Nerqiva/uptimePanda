@@ -174,6 +174,132 @@ pub async fn enforce_db_size_warn(db: &Db) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Application RSS watchdog (SEG-15)
+// ---------------------------------------------------------------------------
+
+/// App RSS (MB) above which the watchdog counts a sample as "over threshold".
+pub const APP_RSS_WARN_MB: u64 = 60;
+
+/// Sustained-over-threshold window before `app_memory_high` is emitted.
+const SUSTAINED_WINDOW_S: u64 = 300;
+
+/// Minimum gap between two `app_memory_high` events.
+const EMIT_RATE_LIMIT_S: u64 = 900;
+
+/// State for the application-RSS watchdog. Pure data — advanced one sample
+/// at a time by [`tick`].
+#[derive(Debug, Default)]
+pub struct WatchdogState {
+    /// Consecutive samples strictly above [`APP_RSS_WARN_MB`].
+    consecutive_over: u32,
+    /// Monotonic sample counter (one per [`tick`] call).
+    sample_seq: u64,
+    /// `sample_seq` of the last emitted `app_memory_high`, if any.
+    last_emit_seq: Option<u64>,
+}
+
+impl WatchdogState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Details of an `app_memory_high` emission decided by [`tick`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchdogEmission {
+    /// The RSS sample (MB) that tripped the watchdog.
+    pub rss_mb: u64,
+    /// How long the app has been over threshold, `consecutive_over * interval_s`.
+    pub sustained_s: u64,
+}
+
+fn ceil_div(a: u64, b: u64) -> u64 {
+    a.div_ceil(b)
+}
+
+/// Advance the watchdog by one sample. `interval_s` is the poll interval in
+/// seconds (clamped to ≥1). Returns `Some(..)` exactly when an
+/// `app_memory_high` event should be recorded: the consecutive over-threshold
+/// count has reached `ceil(300 / interval_s)` and no event was emitted within
+/// the last `ceil(900 / interval_s)` samples. A sample at or below the
+/// threshold resets the consecutive counter (the rate-limit window is kept).
+pub(crate) fn tick(
+    state: &mut WatchdogState,
+    rss_mb: u64,
+    interval_s: i64,
+) -> Option<WatchdogEmission> {
+    let interval = interval_s.max(1) as u64;
+    state.sample_seq += 1;
+    if rss_mb <= APP_RSS_WARN_MB {
+        state.consecutive_over = 0;
+        return None;
+    }
+    state.consecutive_over += 1;
+    let needed = ceil_div(SUSTAINED_WINDOW_S, interval);
+    if u64::from(state.consecutive_over) < needed {
+        return None;
+    }
+    let rate_limit_samples = ceil_div(EMIT_RATE_LIMIT_S, interval);
+    if let Some(last) = state.last_emit_seq
+        && state.sample_seq - last < rate_limit_samples
+    {
+        return None;
+    }
+    state.last_emit_seq = Some(state.sample_seq);
+    Some(WatchdogEmission {
+        rss_mb,
+        sustained_s: u64::from(state.consecutive_over) * interval,
+    })
+}
+
+/// Spawn the application-RSS watchdog: every `rss_poll_interval_s` seconds
+/// (re-read live on each iteration) sample [`app_rss_mb`] and, after a
+/// sustained 5-minute over-threshold stretch, record an `app_memory_high`
+/// row in `browser_events` (`memory_usage` = RSS in bytes). Rate-limited to
+/// one event per 15 minutes. Never panics — unreadable settings or `/proc`
+/// samples just skip the tick. Lives until the runtime drops it at process
+/// exit.
+pub fn spawn_app_rss_watchdog(db: Db) {
+    tokio::spawn(async move {
+        let mut state = WatchdogState::new();
+        loop {
+            let interval_s = match crate::config::typed_i64(&db, "rss_poll_interval_s").await {
+                Ok(v) => v.clamp(1, 3600),
+                Err(e) => {
+                    tracing::error!(error = %e, "app_rss_watchdog: unreadable rss_poll_interval_s; skipping tick");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(interval_s as u64)).await;
+            let Some(rss_mb) = app_rss_mb() else {
+                continue;
+            };
+            let Some(emission) = tick(&mut state, rss_mb, interval_s) else {
+                continue;
+            };
+            let sustained_s = emission.sustained_s;
+            let details = format!(
+                "app_rss_mb={} threshold={} sustained={}s",
+                emission.rss_mb, APP_RSS_WARN_MB, sustained_s
+            );
+            tracing::warn!(
+                app_rss_mb = emission.rss_mb,
+                sustained_s,
+                "application RSS above 60 MB sustained; recording app_memory_high"
+            );
+            let rss_bytes = (emission.rss_mb as i64) * 1024 * 1024;
+            if let Err(e) = db
+                .insert_browser_event("app_memory_high", Some(rss_bytes), Some(&details))
+                .await
+            {
+                tracing::error!(error = %e, "app_rss_watchdog: failed to record browser_events row");
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +453,82 @@ Threads:\t12
         assert!(!should_refuse(120)); // exactly at the floor: allowed
         assert!(!should_refuse(121));
         assert!(!should_refuse(4096));
+    }
+
+    // --- app RSS watchdog state machine ---
+
+    #[test]
+    fn watchdog_emits_after_sustained_window_at_5s_interval() {
+        let mut s = WatchdogState::new();
+        // ceil(300/5) = 60 consecutive over-threshold samples required.
+        for i in 1..60 {
+            assert_eq!(tick(&mut s, 61, 5), None, "sample {i} must not emit yet");
+        }
+        let ev = tick(&mut s, 61, 5).expect("60th consecutive sample emits");
+        assert_eq!(ev.rss_mb, 61);
+        assert_eq!(ev.sustained_s, 300);
+    }
+
+    #[test]
+    fn watchdog_emits_after_sustained_window_at_60s_interval() {
+        let mut s = WatchdogState::new();
+        // ceil(300/60) = 5 consecutive over-threshold samples required.
+        for _ in 0..4 {
+            assert_eq!(tick(&mut s, 100, 60), None);
+        }
+        let ev = tick(&mut s, 100, 60).expect("5th consecutive sample emits");
+        assert_eq!(ev.sustained_s, 300);
+    }
+
+    #[test]
+    fn watchdog_dip_resets_consecutive_counter() {
+        let mut s = WatchdogState::new();
+        for _ in 0..59 {
+            assert_eq!(tick(&mut s, 61, 5), None);
+        }
+        // Dip at/below the threshold resets the streak.
+        assert_eq!(tick(&mut s, 60, 5), None);
+        for _ in 0..59 {
+            assert_eq!(tick(&mut s, 61, 5), None);
+        }
+        let ev = tick(&mut s, 61, 5).expect("full streak after dip emits");
+        assert_eq!(ev.sustained_s, 300);
+    }
+
+    #[test]
+    fn watchdog_rate_limits_to_one_event_per_15_minutes() {
+        let mut s = WatchdogState::new();
+        // First emission at sample 60 (60 * 5s = 300s sustained).
+        for _ in 0..59 {
+            assert_eq!(tick(&mut s, 61, 5), None);
+        }
+        assert!(tick(&mut s, 61, 5).is_some());
+        // Samples 61..=179 (119 more, 600s elapsed) stay under the 15-min
+        // rate limit: ceil(900/5) = 180 samples between emissions.
+        for i in 61..180 {
+            assert_eq!(tick(&mut s, 61, 5), None, "sample {i} rate-limited");
+        }
+        // Sample 240 would be 15 min after sample 60... use exact window:
+        // last emission at seq 60, rate limit 180 samples → seq 240 emits.
+        for i in 180..240 {
+            assert_eq!(tick(&mut s, 61, 5), None, "sample {i} still rate-limited");
+        }
+        assert!(tick(&mut s, 61, 5).is_some(), "window elapsed, emits again");
+    }
+
+    #[test]
+    fn watchdog_sample_at_threshold_is_not_over() {
+        let mut s = WatchdogState::new();
+        assert_eq!(tick(&mut s, 60, 5), None);
+        assert_eq!(s.consecutive_over, 0);
+    }
+
+    #[test]
+    fn watchdog_zero_or_negative_interval_is_clamped() {
+        let mut s = WatchdogState::new();
+        // interval_s <= 0 must not panic or divide by zero; clamped to 1s,
+        // so ceil(300/1) = 300 samples needed.
+        assert_eq!(tick(&mut s, 61, 0), None);
+        assert_eq!(tick(&mut s, 61, -5), None);
     }
 }

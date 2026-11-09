@@ -231,6 +231,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    // SEG-15: application-RSS watchdog — samples every `rss_poll_interval_s`
+    // seconds (re-read live on each iteration) and records an
+    // `app_memory_high` browser_events row after a sustained 5-minute
+    // over-threshold stretch (rate-limited to one row per 15 minutes).
+    resources::spawn_app_rss_watchdog(db.clone());
 
     let app_state = state::SharedState::new(state::AppState::new(
         db.clone(),
