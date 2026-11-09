@@ -1,34 +1,24 @@
 {% extends "layout.html" %}
 {% block content %}
 <div class="card">
-  <p class="muted">Every runtime tunable from the seed table is editable below. Validation bounds are enforced server-side on save; invalid input is rejected with a message. Boolean keys accept <code>true</code>/<code>false</code>. <code>concurrent_visits</code> is pinned to 1 by design. Grouping, help text and restore-defaults land in SEG-14.</p>
-  <div class="chiprow"><span class="chip">23 keys</span><span class="chip">validated on write</span></div>
+  <div class="chiprow">
+    <span class="chip">{{ total_keys }} tunables</span>
+    <span class="chip">{{ default_keys }} of {{ total_keys }} at default</span>
+    <span class="chip">validated on write</span>
+  </div>
+  <p class="muted">Every runtime tunable from the seed table is editable here — current value shown next to the 512&nbsp;MB&nbsp;/&nbsp;0.15&nbsp;vCPU default. Edits are validated server-side on save; out-of-bounds or unknown keys are rejected with a verbatim message. <code>concurrent_visits</code> is pinned to 1 by design. Rows marked <span class="chip restart-chip">restart required</span> only take effect on the next boot.</p>
+  <form class="settings-restore-form" method="post" action="/settings/restore-defaults" hx-post="/settings/restore-defaults" hx-swap="none">
+    <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
+    <button class="btn danger" type="submit" data-confirm="Restore every setting to its 512MB/0.15 vCPU default? Your edits will be lost.|Restore defaults">Restore defaults</button>
+  </form>
 </div>
-<div class="card">
-  <table class="table">
-    <thead>
-      <tr><th>Setting</th><th>Current</th><th>Default</th><th>Bounds</th><th>Save</th></tr>
-    </thead>
-    <tbody>
-      {% for s in settings %}
-      <tr>
-        <td><div>{{ s.key }}</div><div class="muted table-url">{{ s.help }}</div></td>
-        <td><code>{{ s.value }}</code>{% if s.value == s.default %} <span class="pill">default</span>{% else %} <span class="pill warn">modified</span>{% endif %}</td>
-        <td class="muted"><code>{{ s.default }}</code></td>
-        <td class="muted">{{ s.bounds }}</td>
-        <td>
-          <form method="post" action="/settings" hx-patch="/settings" hx-swap="none" class="settings-row-form">
-            <input type="hidden" name="csrf_token" value="{{ chrome.csrf }}">
-            <input type="hidden" name="key" value="{{ s.key }}">
-            <div class="field-inline">
-              <input type="text" name="value" value="{{ s.value }}" aria-label="{{ s.key }}" inputmode="{{ s.inputmode }}" autocomplete="off">
-              <button class="btn small" type="submit">Save</button>
-            </div>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-</div>
+{% for group in groups %}
+<section class="card setting-group" id="settings-{{ group.anchor }}" aria-labelledby="settings-title-{{ group.anchor }}">
+  <h2 class="section-title setting-group-title" id="settings-title-{{ group.anchor }}">{{ group.title }}</h2>
+  <p class="muted setting-group-blurb">{{ group.blurb }}</p>
+  <div class="setting-rows">
+    {% for s in group.rows %}{% include "partials/setting_row.html" %}{% endfor %}
+  </div>
+</section>
+{% endfor %}
 {% endblock %}

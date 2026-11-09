@@ -22,12 +22,12 @@
       <div class="field"><span>Profile</span><select name="profile_id"><option value="">Default (all cookies isolated)</option>{% for p in profiles %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}</select></div>
       <div class="field"><span>Monitoring mode</span><select name="monitoring_mode"><option value="basic">basic — navigate, hold, close</option><option value="interaction">interaction — replay configured actions</option></select></div>
       <div class="field-inline">
-        <div class="field"><span>Min interval (s)</span><input type="number" name="min_interval_seconds" value="480" min="30" max="86400" required></div>
-        <div class="field"><span>Max interval (s)</span><input type="number" name="max_interval_seconds" value="780" min="30" max="86400" required></div>
+        <div class="field"><span>Min interval (s)</span><input type="number" name="min_interval_seconds" value="{{ default_min_interval_seconds }}" min="30" max="86400" required></div>
+        <div class="field"><span>Max interval (s)</span><input type="number" name="max_interval_seconds" value="{{ default_max_interval_seconds }}" min="30" max="86400" required></div>
       </div>
       <div class="field-inline">
-        <div class="field"><span>Min session (s)</span><input type="number" name="min_session_seconds" value="15" min="5" max="3600" required></div>
-        <div class="field"><span>Max session (s)</span><input type="number" name="max_session_seconds" value="60" min="5" max="3600" required></div>
+        <div class="field"><span>Min session (s)</span><input type="number" name="min_session_seconds" value="{{ default_min_session_seconds }}" min="5" max="3600" required></div>
+        <div class="field"><span>Max session (s)</span><input type="number" name="max_session_seconds" value="{{ default_max_session_seconds }}" min="5" max="3600" required></div>
       </div>
       <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
       <div class="modal-actions">

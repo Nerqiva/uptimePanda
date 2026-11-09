@@ -386,9 +386,19 @@ impl Executor {
         };
         let handle = cdp.into_handle();
 
-        let ua = profile
-            .as_ref()
-            .and_then(|p| p.user_agent().map(str::to_string));
+        // ua_presets_enabled=false suppresses every UA override for this
+        // visit (live read; default true). The profile's own UA is used
+        // exactly as stored otherwise.
+        let ua_enabled = config::typed_bool(&self.db, "ua_presets_enabled")
+            .await
+            .unwrap_or(true);
+        let ua = if ua_enabled {
+            profile
+                .as_ref()
+                .and_then(|p| p.user_agent().map(str::to_string))
+        } else {
+            None
+        };
         if ua.is_some() {
             debug!(%USER_AGENT_OVERRIDE_LABEL, "sending ua override (engine may ignore)");
         }

@@ -1,6 +1,5 @@
-// The settings API (SETTING_DEFAULTS, seed_settings, get/set/effective_settings)
-// is consumed only by unit tests until the Settings page lands (SEG-14); silence
-// dead_code for it until then — same pattern as src/db/mod.rs.
+// The settings API keeps a few test-only helpers (e.g. `restore_default`)
+// that the Settings page (SEG-14) does not call; silence dead_code for them.
 #![allow(dead_code)]
 
 //! Config module — resolves every runtime knob for uptimePanda.
@@ -596,6 +595,24 @@ pub struct SettingView {
     pub help: &'static str,
 }
 
+/// Effective view of a single setting. Returns `None` for unknown keys —
+/// lets the Settings page re-render one row fragment after a write (or a
+/// rejected write) without loading the whole table.
+pub async fn view_setting(db: &Db, key: &str) -> Result<Option<SettingView>, DbError> {
+    let Some(def) = default_for(key) else {
+        return Ok(None);
+    };
+    Ok(Some(SettingView {
+        key: def.key,
+        value: get_setting(db, def.key).await?,
+        default: def.value,
+        min: def.min,
+        max: def.max,
+        is_bool: def.is_bool,
+        help: def.help,
+    }))
+}
+
 /// Effective view of every known setting, in table order.
 pub async fn effective_settings(db: &Db) -> Result<Vec<SettingView>, DbError> {
     let mut views = Vec::with_capacity(SETTING_DEFAULTS.len());
@@ -611,6 +628,29 @@ pub async fn effective_settings(db: &Db) -> Result<Vec<SettingView>, DbError> {
         });
     }
     Ok(views)
+}
+
+/// Reset **every** [`SETTING_DEFAULTS`] key to its default value in a
+/// single database transaction (all-or-nothing). Default values are
+/// canonical — they bypass [`validate_setting`] on purpose, and the
+/// interval/session pair invariants hold for the seed table itself
+/// (enforced by [`seed_settings`]). `concurrent_visits` is "restored" to
+/// `1`, its canonical single-worker value.
+///
+/// Returns the number of keys written.
+pub async fn restore_all_defaults(db: &Db) -> Result<usize, String> {
+    // Re-assert the seed-table pair invariant before overwriting live data.
+    check_default_pair(INTERVAL_PAIR).map_err(|e| e.to_string())?;
+    check_default_pair(SESSION_PAIR).map_err(|e| e.to_string())?;
+    let pairs: Vec<(&str, &str)> = SETTING_DEFAULTS.iter().map(|d| (d.key, d.value)).collect();
+    db.reset_application_settings(&pairs)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Is `key` a boolean-typed setting? Returns `None` for unknown keys.
+pub fn is_bool_key(key: &str) -> Option<bool> {
+    default_for(key).map(|d| d.is_bool)
 }
 
 // ---------------------------------------------------------------------------

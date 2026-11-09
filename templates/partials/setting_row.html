@@ -1,0 +1,37 @@
+<div class="setting-row{% if s.read_only %} setting-row-fixed{% endif %}" id="setting-row-{{ s.key }}"{% if s.oob %} hx-swap-oob="outerHTML"{% endif %}>
+  <div class="setting-main">
+    <div class="setting-meta">
+      <div class="setting-key-line">
+        <code class="setting-key">{{ s.key }}</code>
+        {% if s.default_badge %}<span class="pill default-badge">default</span>{% else %}<span class="pill warn">modified</span>{% endif %}
+        {% if s.needs_restart %}<span class="chip restart-chip">restart required</span>{% endif %}
+        {% if s.read_only %}<span class="chip">1 by design</span>{% endif %}
+      </div>
+      <p class="muted setting-help">{{ s.help }}</p>
+    </div>
+    <div class="setting-figures">
+      <span class="setting-fig"><span class="setting-label">current</span><code>{{ s.value }}</code></span>
+      <span class="setting-fig"><span class="setting-label">default</span><code>{{ s.default }}</code></span>
+      <span class="setting-fig"><span class="setting-label">bounds</span><span class="setting-bounds">{{ s.bounds }}</span></span>
+    </div>
+    <form class="settings-row-form setting-form" method="post" action="/settings"{% if !s.read_only %} hx-patch="/settings" hx-target="#setting-row-{{ s.key }}" hx-swap="outerHTML"{% endif %}>
+      <input type="hidden" name="csrf_token" value="{{ s.csrf }}">
+      <input type="hidden" name="key" value="{{ s.key }}">
+      {% if s.read_only %}
+      <span class="setting-fixed"><code>{{ s.value }}</code> — pinned to 1 (single worker)</span>
+      {% else if s.input_kind == "bool" %}
+      <label class="check setting-check"><input type="checkbox" name="value" value="true"{% if s.value == "true" %} checked{% endif %} aria-label="{{ s.key }}"> Enabled</label>
+      <button class="btn small" type="submit">Save</button>
+      {% else if s.input_kind == "select" %}
+      <select name="value" aria-label="{{ s.key }}">{% for opt in s.select_options %}<option value="{{ opt.value }}"{% if opt.selected %} selected{% endif %}>{{ opt.value }}</option>{% endfor %}</select>
+      <button class="btn small" type="submit">Save</button>
+      {% else if s.input_kind == "number" %}
+      <input type="number" name="value" value="{{ s.value }}" min="{{ s.min_attr }}" max="{{ s.max_attr }}" inputmode="numeric" aria-label="{{ s.key }}" required>
+      <button class="btn small" type="submit">Save</button>
+      {% else %}
+      <input type="text" name="value" value="{{ s.value }}" inputmode="{{ s.inputmode }}" autocomplete="off" aria-label="{{ s.key }}" required>
+      <button class="btn small" type="submit">Save</button>
+      {% endif %}
+    </form>
+  </div>
+</div>

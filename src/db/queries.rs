@@ -769,6 +769,39 @@ impl Db {
         Ok(())
     }
 
+    /// Atomically reset the given `key`/`value` pairs in a **single
+    /// transaction** — either every row is written or none is. Used by the
+    /// Settings page "Restore defaults" action; the pairs are canonical
+    /// seed values, so callers bypass value validation on purpose.
+    pub async fn reset_application_settings(&self, pairs: &[(&str, &str)]) -> Result<usize> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let count = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<usize> {
+                let tx = c.transaction()?;
+                let mut n = 0usize;
+                for (key, value) in &owned {
+                    tx.execute(
+                        "INSERT INTO application_settings
+                            (setting_key, setting_value, updated_at)
+                         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                         ON CONFLICT(setting_key) DO UPDATE SET
+                            setting_value = excluded.setting_value,
+                            updated_at = excluded.updated_at",
+                        params![key, value],
+                    )?;
+                    n += 1;
+                }
+                tx.commit()?;
+                Ok(n)
+            })
+            .await?;
+        Ok(count)
+    }
+
     /// All `application_settings` rows as `(key, value)` pairs, ordered by key.
     pub async fn all_application_settings(&self) -> Result<Vec<(String, String)>> {
         let rows = self

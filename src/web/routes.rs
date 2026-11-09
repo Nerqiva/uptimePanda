@@ -82,6 +82,10 @@ pub fn build_router(state: SharedState) -> axum::Router {
                 .patch(settings_update)
                 .post(settings_update),
         )
+        .route(
+            "/settings/restore-defaults",
+            post(settings_restore_defaults),
+        )
         .route("/api/system", get(api_system))
         .route("/backup", post(backup_create))
         // Raw .db upload; 64 MB body limit instead of the global 64 KB.
@@ -598,11 +602,34 @@ async fn websites_page(
             name: p.name,
         })
         .collect();
+    // SEG-14: prefill the Add-website form from the default_* settings,
+    // live-read on every render (edits on the Settings page apply to the
+    // next page load).
+    let default_min_interval_seconds =
+        crate::config::typed_i64(&state.db, "default_min_interval_seconds")
+            .await
+            .unwrap_or(480);
+    let default_max_interval_seconds =
+        crate::config::typed_i64(&state.db, "default_max_interval_seconds")
+            .await
+            .unwrap_or(780);
+    let default_min_session_seconds =
+        crate::config::typed_i64(&state.db, "default_min_session_seconds")
+            .await
+            .unwrap_or(15);
+    let default_max_session_seconds =
+        crate::config::typed_i64(&state.db, "default_max_session_seconds")
+            .await
+            .unwrap_or(60);
     html(templates::render_ok(&WebsitesPage {
         chrome,
         entries,
         profiles,
         form_error: String::new(),
+        default_min_interval_seconds,
+        default_max_interval_seconds,
+        default_min_session_seconds,
+        default_max_session_seconds,
     }))
 }
 
@@ -1927,44 +1954,248 @@ async fn backup_restore(
 // Settings
 // ---------------------------------------------------------------------------
 
+/// Display bounds for one row; shared by the page renderer and the
+/// single-row / restore-all fragments.
+fn setting_bounds_label(v: &crate::config::SettingView) -> String {
+    if v.is_bool {
+        "true|false".to_string()
+    } else if v.key == "active_window_default" {
+        "'<N>h' (1–168)".to_string()
+    } else if v.key == "log_level" {
+        "trace|debug|info|warn|error".to_string()
+    } else {
+        match (v.min, v.max) {
+            (Some(min), Some(max)) => format!("{min}–{max}"),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Keys that only take effect at the next boot; rows carrying one of these
+/// get the subtle "restart required" chip. RSS/poll/browser keys are NOT
+/// here — the manager and health loop re-read them live.
+const RESTART_REQUIRED_KEYS: &[&str] = &["log_level", "sqlite_maintenance_on_boot"];
+/// Keys shown read-only (pinned to the single canonical value).
+const READ_ONLY_KEYS: &[&str] = &["concurrent_visits"];
+const LOG_LEVEL_OPTIONS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+
+/// (title, blurb, anchor, keys) — display order is the contract with the
+/// SEG-14 spec. Every SETTING_DEFAULTS key appears in exactly one group
+/// (guarded by `setting_groups_cover_seed_table` in the test module).
+const SETTING_GROUPS: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "Browser & memory",
+        "Process-level limits and cadence for the Lightpanda worker. RSS thresholds and the poll interval are re-read live on every health tick — edits apply on the next pass.",
+        "browser-memory",
+        &[
+            "memory_warn_mb",
+            "memory_restart_mb",
+            "browser_restart_timeout_s",
+            "browser_respawn_delay_s",
+            "concurrent_visits",
+            "rss_poll_interval_s",
+        ],
+    ),
+    (
+        "Navigation & visits",
+        "Per-visit navigation and session-budget bounds. The default_min/max_* pairs prefill the Add-website form on the next page load; ua_presets_enabled gates the compatibility UA override, checked per visit.",
+        "navigation-visits",
+        &[
+            "nav_timeout_s",
+            "visit_timeout_s",
+            "max_session_seconds_cap",
+            "default_min_interval_seconds",
+            "default_max_interval_seconds",
+            "default_min_session_seconds",
+            "default_max_session_seconds",
+            "ua_presets_enabled",
+        ],
+    ),
+    (
+        "Scheduler & interactions",
+        "Queueing and interaction-sequence bounds. The queue bound is live-checked on every manual enqueue (scheduled refills flow from the DB source of truth and are not rejected).",
+        "scheduler-interactions",
+        &[
+            "active_window_default",
+            "max_queue_length",
+            "max_actions_per_sequence",
+            "interaction_scroll_max_ops",
+            "interaction_click_wait_max_ms",
+        ],
+    ),
+    (
+        "History & database",
+        "Retention and storage guards. history_retention_days is enforced by the retention pass (on boot, then every 24h). db_size_warn_mb is stored for a dashboard warning; advisory enforcement lands with SEG-15/16.",
+        "history-database",
+        &[
+            "history_retention_days",
+            "sqlite_maintenance_on_boot",
+            "db_size_warn_mb",
+        ],
+    ),
+    (
+        "Logging",
+        "Boot-time tracing filter. The value is stored now; the running process keeps its boot-time filter — restart required.",
+        "logging",
+        &["log_level"],
+    ),
+];
+
+fn setting_row_view(v: crate::config::SettingView, csrf: &str, oob: bool) -> SettingRowView {
+    let read_only = READ_ONLY_KEYS.contains(&v.key);
+    let needs_restart = RESTART_REQUIRED_KEYS.contains(&v.key);
+    let input_kind: &'static str = if read_only {
+        "fixed"
+    } else if v.is_bool {
+        "bool"
+    } else if v.key == "log_level" {
+        "select"
+    } else if v.min.is_some() && v.max.is_some() {
+        "number"
+    } else {
+        "text"
+    };
+    let inputmode: &'static str = if v.is_bool || v.key == "log_level" {
+        "text"
+    } else if v.min.is_some() {
+        "numeric"
+    } else {
+        "text"
+    };
+    let bounds = setting_bounds_label(&v);
+    let default_badge = v.value == v.default;
+    let min_attr = v.min.map(|m| m.to_string()).unwrap_or_default();
+    let max_attr = v.max.map(|m| m.to_string()).unwrap_or_default();
+    let select_options = if v.key == "log_level" {
+        LOG_LEVEL_OPTIONS
+            .iter()
+            .map(|value| SelectOptionView {
+                value,
+                selected: *value == v.value,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    SettingRowView {
+        key: v.key.to_string(),
+        default_badge,
+        value: v.value,
+        default: v.default.to_string(),
+        bounds,
+        help: v.help.to_string(),
+        input_kind,
+        min_attr,
+        max_attr,
+        needs_restart,
+        read_only,
+        oob,
+        csrf: csrf.to_string(),
+        select_options,
+        inputmode,
+    }
+}
+
+fn setting_row_html(view: crate::config::SettingView, csrf: &str, oob: bool) -> String {
+    let row = setting_row_view(view, csrf, oob);
+    SettingRowFragment { s: &row }
+        .render()
+        .unwrap_or_else(|_| String::new())
+}
+
+/// Flatten views into SETTING_GROUPS order; unknown leftovers go last.
+fn ordered_views(views: Vec<crate::config::SettingView>) -> Vec<crate::config::SettingView> {
+    let mut by_key: HashMap<&'static str, crate::config::SettingView> =
+        views.into_iter().map(|v| (v.key, v)).collect();
+    let mut ordered = Vec::with_capacity(by_key.len());
+    for (_title, _blurb, _anchor, keys) in SETTING_GROUPS {
+        for key in *keys {
+            if let Some(v) = by_key.remove(key) {
+                ordered.push(v);
+            }
+        }
+    }
+    let mut leftover: Vec<_> = by_key.drain().collect();
+    leftover.sort_by(|a, b| a.0.cmp(b.0));
+    if !leftover.is_empty() {
+        tracing::error!(keys = ?leftover.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            "SETTING_GROUPS is missing seed keys");
+        ordered.extend(leftover.into_iter().map(|(_, v)| v));
+    }
+    ordered
+}
+
+async fn grouped_settings(state: &AppState) -> Result<SettingGroupsOutcome, AppError> {
+    let views = crate::config::effective_settings(&state.db).await?;
+    let total_keys = views.len();
+    let default_keys = views.iter().filter(|v| v.value == v.default).count();
+    let csrf = crate::web::csrf::csrf_token(&state.session_key);
+    let mut by_key: HashMap<&'static str, crate::config::SettingView> =
+        views.into_iter().map(|v| (v.key, v)).collect();
+    let mut groups = Vec::with_capacity(SETTING_GROUPS.len() + 1);
+    for (title, blurb, anchor, keys) in SETTING_GROUPS {
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in *keys {
+            if let Some(v) = by_key.remove(key) {
+                rows.push(setting_row_view(v, &csrf, false));
+            }
+        }
+        groups.push(SettingGroupView {
+            title,
+            blurb,
+            anchor,
+            rows,
+        });
+    }
+    if !by_key.is_empty() {
+        // A seed key missing from every group must never be silently
+        // hidden — render it under "Other" and scream in the logs.
+        let mut leftover: Vec<_> = by_key.drain().collect();
+        leftover.sort_by(|a, b| a.0.cmp(b.0));
+        tracing::error!(keys = ?leftover.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            "SETTING_GROUPS is missing keys; rendered under Other");
+        groups.push(SettingGroupView {
+            title: "Other",
+            blurb: "Seed-table keys missing from the grouping table — this is a bug.",
+            anchor: "other",
+            rows: leftover
+                .into_iter()
+                .map(|(_, v)| setting_row_view(v, &csrf, false))
+                .collect(),
+        });
+    }
+    Ok(SettingGroupsOutcome {
+        groups,
+        total_keys,
+        default_keys,
+    })
+}
+
+struct SettingGroupsOutcome {
+    groups: Vec<SettingGroupView>,
+    total_keys: usize,
+    default_keys: usize,
+}
+
 async fn settings_page(
     State(state): State<SharedState>,
     session: Extension<SessionInfo>,
 ) -> Result<Response, AppError> {
     let chrome = build_chrome(&state, "Settings", "settings", &session);
-    let views = crate::config::effective_settings(&state.db).await?;
-    let settings = views
-        .into_iter()
-        .map(|v| {
-            let bounds = if v.is_bool {
-                "true|false".to_string()
-            } else if v.key == "active_window_default" {
-                "'<N>h' (1–168)".to_string()
-            } else if v.key == "log_level" {
-                "trace|debug|info|warn|error".to_string()
-            } else {
-                match (v.min, v.max) {
-                    (Some(min), Some(max)) => format!("{min}–{max}"),
-                    _ => String::new(),
-                }
-            };
-            SettingRowView {
-                key: v.key.to_string(),
-                value: v.value,
-                default: v.default.to_string(),
-                bounds,
-                help: v.help.to_string(),
-                inputmode: if v.is_bool { "text" } else { "numeric" },
-            }
-        })
-        .collect();
-    html(templates::render_ok(&SettingsPage { chrome, settings }))
+    let outcome = grouped_settings(&state).await?;
+    html(templates::render_ok(&SettingsPage {
+        chrome,
+        groups: outcome.groups,
+        total_keys: outcome.total_keys,
+        default_keys: outcome.default_keys,
+    }))
 }
 
 #[derive(Deserialize)]
 pub struct SettingForm {
     key: String,
-    value: String,
+    /// Checkbox rows submit nothing when unchecked; text/number rows always send it.
+    value: Option<String>,
     /// Consumed by the `require_auth` middleware (see CsrfOnlyForm).
     #[allow(dead_code)]
     /// Consumed by the `require_auth` middleware (see CsrfOnlyForm).
@@ -1976,20 +2207,40 @@ pub struct SettingForm {
     csrf_token: String,
 }
 
+/// Re-render the row fragment for `key` post-write (or post-rejection,
+/// which shows the unchanged DB value). Returns `None` for unknown keys —
+/// crafted forms cannot target a row that does not exist.
+async fn rerender_row(state: &AppState, key: &str) -> Option<String> {
+    let csrf = crate::web::csrf::csrf_token(&state.session_key);
+    match crate::config::view_setting(&state.db, key).await {
+        Ok(Some(view)) => Some(setting_row_html(view, &csrf, false)),
+        _ => None,
+    }
+}
+
 async fn settings_update(
     State(state): State<SharedState>,
     _session: Extension<SessionInfo>,
     headers: HeaderMap,
     Form(form): Form<SettingForm>,
 ) -> Result<Response, AppError> {
-    let key = form.key.trim();
+    let key = form.key.trim().to_string();
+    let is_bool = crate::config::is_bool_key(&key) == Some(true);
     // set_setting validates the key against the seed table and the bounds,
-    // including the interval/session pair invariants.
-    match crate::config::set_setting(&state.db, key, form.value.trim()).await {
+    // including the interval/session pair invariants — not weakened here.
+    let raw_value = match (form.value.as_deref().map(str::trim), is_bool) {
+        (Some(v), _) => v.to_string(),
+        // Unchecked checkbox submits no `value` — that *is* the boolean false.
+        (None, true) => "false".to_string(),
+        (None, false) => String::new(), // rejected by the validator below
+    };
+    match crate::config::set_setting(&state.db, &key, &raw_value).await {
         Ok(()) => {
-            let msg = format!("Set {key} = {}", form.value.trim());
+            let msg = format!("Set {key} = {raw_value}");
             if wants_htmx(&headers) {
-                Ok(Html(toast("ok", msg)).into_response())
+                let mut body = rerender_row(&state, &key).await.unwrap_or_default();
+                body.push_str(&toast("ok", msg));
+                Ok(Html(body).into_response())
             } else {
                 Ok(Redirect::to("/settings").into_response())
             }
@@ -1997,9 +2248,56 @@ async fn settings_update(
         Err(msg) => {
             let full = format!("{key}: {msg}");
             if wants_htmx(&headers) {
-                Ok(Html(toast("err", full)).into_response())
+                let mut body = rerender_row(&state, &key).await.unwrap_or_default();
+                body.push_str(&toast("err", full));
+                Ok(Html(body).into_response())
             } else {
                 Ok(templates::error_page(StatusCode::BAD_REQUEST, "400", &full))
+            }
+        }
+    }
+}
+
+/// Restore every seeded key to its SEG-04 default in a single transaction;
+/// defaults are canonical so validation is bypassed by design.
+async fn settings_restore_defaults(
+    State(state): State<SharedState>,
+    _session: Extension<SessionInfo>,
+    headers: HeaderMap,
+    Form(_form): Form<CsrfOnlyForm>,
+) -> Result<Response, AppError> {
+    match crate::config::restore_all_defaults(&state.db).await {
+        Ok(written) => {
+            tracing::info!(keys = written, "settings restored to defaults");
+            let msg = "All settings restored to 512MB/0.15 vCPU defaults".to_string();
+            if wants_htmx(&headers) {
+                // Full settings-grid refresh out-of-band + toast (SEG-11
+                // pattern): every row swaps itself by id.
+                let views = crate::config::effective_settings(&state.db).await?;
+                let ordered = ordered_views(views);
+                let csrf = crate::web::csrf::csrf_token(&state.session_key);
+                let rows: Vec<SettingRowView> = ordered
+                    .into_iter()
+                    .map(|v| setting_row_view(v, &csrf, true))
+                    .collect();
+                let mut body = templates::render_ok(&SettingsRestoreFragment { rows })?.0;
+                body.push_str(&toast("ok", msg));
+                Ok(Html(body).into_response())
+            } else {
+                Ok(Redirect::to("/settings").into_response())
+            }
+        }
+        Err(msg) => {
+            let full = format!("restore defaults failed: {msg}");
+            tracing::error!(error = %full, "settings restore failed");
+            if wants_htmx(&headers) {
+                Ok(Html(toast("err", full)).into_response())
+            } else {
+                Ok(templates::error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "500",
+                    &full,
+                ))
             }
         }
     }
@@ -2428,6 +2726,440 @@ mod tests {
         ))
         .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    // --- SEG-14: grouped settings page + restore defaults ---
+
+    #[test]
+    fn setting_groups_cover_seed_table_exactly_once() {
+        let mut grouped: Vec<&str> = SETTING_GROUPS
+            .iter()
+            .flat_map(|(_t, _b, _a, keys)| keys.iter().copied())
+            .collect();
+        let grouped_len = grouped.len();
+        grouped.sort();
+        grouped.dedup();
+        assert_eq!(
+            grouped.len(),
+            grouped_len,
+            "duplicate key in SETTING_GROUPS"
+        );
+        assert_eq!(grouped.len(), 23, "every seed key must be grouped");
+        for def in crate::config::SETTING_DEFAULTS {
+            assert!(
+                grouped.contains(&def.key),
+                "seed key {} is not in any group",
+                def.key
+            );
+        }
+        // Restart chips exactly for the two boot-only keys.
+        assert_eq!(
+            RESTART_REQUIRED_KEYS,
+            &["log_level", "sqlite_maintenance_on_boot"]
+        );
+    }
+
+    async fn settings_get_body(app: &Router, cookie: &str) -> String {
+        let (status, _h, body) = request(
+            app.clone(),
+            "GET",
+            "/settings",
+            &[("cookie", cookie)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        String::from_utf8(body).expect("settings page utf-8")
+    }
+
+    #[tokio::test]
+    async fn settings_page_renders_groups_in_order_and_all_23_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state);
+        let cookie = login_cookie(&app).await;
+        let body = settings_get_body(&app, &cookie).await;
+        // askama escapes '&' as &#38; — check the escaped header text.
+        let positions = [
+            body.find("Browser &#38; memory"),
+            body.find("Navigation &#38; visits"),
+            body.find("Scheduler &#38; interactions"),
+            body.find("History &#38; database"),
+            body.find("Logging"),
+        ];
+        let mut last = 0usize;
+        for (i, pos) in positions.iter().enumerate() {
+            let pos = pos.unwrap_or_else(|| panic!("group {i} header missing from page"));
+            assert!(pos >= last, "group {i} rendered out of order");
+            last = pos;
+        }
+        for def in crate::config::SETTING_DEFAULTS {
+            assert!(
+                body.contains(&format!("id=\"setting-row-{}\"", def.key)),
+                "row for {} missing",
+                def.key
+            );
+        }
+        // Restart chips + fixed row annotations.
+        assert!(body.contains("restart required"), "restart chip rendered");
+        assert!(
+            body.contains("1 by design"),
+            "concurrent_visits pinned annotation rendered"
+        );
+        assert!(
+            body.contains("action=\"/settings/restore-defaults\""),
+            "restore defaults form rendered"
+        );
+        // concurrent_visits is read-only: no editable value input for it.
+        assert!(
+            !body.contains("aria-label=\"concurrent_visits\""),
+            "concurrent_visits must not render an editor"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_default_badge_tracks_value_vs_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+
+        let body = settings_get_body(&app, &cookie).await;
+        let row = |body: &str, key: &str| {
+            let start = body
+                .find(&format!("id=\"setting-row-{key}\""))
+                .expect("row");
+            let end = body[start + 1..]
+                .find("id=\"setting-row-")
+                .map(|n| start + 1 + n)
+                .unwrap_or(body.len());
+            body[start..end].to_string()
+        };
+        assert!(
+            row(&body, "memory_warn_mb").contains("pill default-badge"),
+            "default-valued row carries the default badge"
+        );
+
+        let (status, _h, _b) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!("key=memory_warn_mb&value=161&csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+
+        let body = settings_get_body(&app, &cookie).await;
+        let row = row(&body, "memory_warn_mb");
+        assert!(
+            !row.contains("pill default-badge"),
+            "mutated row loses the default badge"
+        );
+        assert!(row.contains("modified"), "mutated row shows modified pill");
+    }
+
+    #[tokio::test]
+    async fn settings_htmx_patch_returns_row_fragment_and_toast() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+
+        let htmx = [
+            ("cookie", cookie.as_str()),
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("hx-request", "true"),
+        ];
+        let (status, _h, body) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &htmx,
+            Body::from(format!("key=memory_restart_mb&value=150&csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("fragment utf-8");
+        assert!(
+            text.contains("id=\"setting-row-memory_restart_mb\""),
+            "response re-renders the row fragment: {text}"
+        );
+        assert!(text.contains(">150<"), "row shows the new value: {text}");
+        assert!(
+            text.contains("hx-swap-oob=\"beforeend:#toast-region\""),
+            "toast is OOB: {text}"
+        );
+        assert!(text.contains("Set memory_restart_mb = 150"), "{text}");
+
+        // Validator message verbatim in the error toast; row re-rendered
+        // unchanged.
+        let (status, _h, body) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &htmx,
+            Body::from(format!("key=memory_restart_mb&value=50&csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("fragment utf-8");
+        assert!(
+            text.contains("memory_restart_mb must be &#62;= 96"),
+            "{text}"
+        );
+        assert!(text.contains("got 50"), "{text}");
+        assert!(
+            text.contains("id=\"setting-row-memory_restart_mb\""),
+            "error path re-renders the row: {text}"
+        );
+        assert!(
+            text.contains(">150<"),
+            "rejected write keeps prior value: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_bool_toggle_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+        let form_headers = [
+            ("cookie", cookie.as_str()),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ];
+        // Explicit false.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &form_headers,
+            Body::from(format!(
+                "key=sqlite_maintenance_on_boot&value=false&csrf_token={csrf}"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("sqlite_maintenance_on_boot")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("false")
+        );
+        // Unchecked checkbox semantics: submission with NO value field == false.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &form_headers,
+            Body::from(format!("key=sqlite_maintenance_on_boot&csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("sqlite_maintenance_on_boot")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("false")
+        );
+        // Back to true.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &form_headers,
+            Body::from(format!(
+                "key=sqlite_maintenance_on_boot&value=true&csrf_token={csrf}"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("sqlite_maintenance_on_boot")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_patch_cross_pair_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+        // min stays 480 while max is dragged to 60 → min > max → 400.
+        let (status, _h, body) = request(
+            app.clone(),
+            "PATCH",
+            "/settings",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            Body::from(format!(
+                "key=default_max_interval_seconds&value=60&csrf_token={csrf}"
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(body).expect("error page utf-8");
+        assert!(text.contains("default_min_interval_seconds"), "{text}");
+        assert!(text.contains("480"), "{text}");
+        // Unchanged.
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("default_max_interval_seconds")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("780")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_restore_defaults_resets_mutated_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = in_memory_state(dir.path()).await;
+        let app = app(state.clone());
+        let cookie = login_cookie(&app).await;
+        let csrf = csrf_for(&app, &cookie).await;
+        let form_headers = [
+            ("cookie", cookie.as_str()),
+            ("content-type", "application/x-www-form-urlencoded"),
+        ];
+
+        // Mutate two keys.
+        for (key, value) in [("memory_restart_mb", "150"), ("log_level", "debug")] {
+            let (status, _h, _b) = request(
+                app.clone(),
+                "PATCH",
+                "/settings",
+                &form_headers,
+                Body::from(format!("key={key}&value={value}&csrf_token={csrf}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+        }
+
+        // Plain (non-htmx) restore → 303.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/settings/restore-defaults",
+            &form_headers,
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("memory_restart_mb")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("200")
+        );
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("log_level")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("info")
+        );
+
+        // Mutate again, restore via htmx → 200 + OOB rows + toast.
+        for (key, value) in [("memory_restart_mb", "150")] {
+            let (status, _h, _b) = request(
+                app.clone(),
+                "PATCH",
+                "/settings",
+                &form_headers,
+                Body::from(format!("key={key}&value={value}&csrf_token={csrf}")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+        }
+        let (status, _h, body) = request(
+            app.clone(),
+            "POST",
+            "/settings/restore-defaults",
+            &[
+                ("cookie", cookie.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("hx-request", "true"),
+            ],
+            Body::from(format!("csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("restore fragment utf-8");
+        assert!(
+            text.contains("All settings restored to 512MB/0.15 vCPU defaults"),
+            "{text}"
+        );
+        assert!(
+            text.contains("id=\"setting-row-memory_restart_mb\""),
+            "{text}"
+        );
+        assert!(
+            text.matches("hx-swap-oob=\"outerHTML\"").count() >= 23,
+            "restore response refreshes every row out-of-band: {text}"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_application_setting("memory_restart_mb")
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("200"),
+            "htmx restore also persists defaults"
+        );
+
+        // CSRF is enforced on the restore endpoint.
+        let (status, _h, _b) = request(
+            app.clone(),
+            "POST",
+            "/settings/restore-defaults",
+            &form_headers,
+            Body::from("csrf_token=WRONG"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // concurrent_visits stays 1 (canonical default), and the DB now
+        // holds defaults for every seeded key.
+        let rows = state.db.all_application_settings().await.expect("rows");
+        assert_eq!(rows.len(), 23);
+        for (key, value) in rows {
+            let def = crate::config::SETTING_DEFAULTS
+                .iter()
+                .find(|d| d.key == key)
+                .expect("seeded key");
+            assert_eq!(value, def.value, "row {key} restored to default");
+        }
     }
 
     #[tokio::test]

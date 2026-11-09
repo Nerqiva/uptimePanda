@@ -97,6 +97,12 @@ pub struct WebsitesPage {
     pub entries: Vec<WebsiteEntryView>,
     pub profiles: Vec<ProfileOptionView>,
     pub form_error: String,
+    /// Prefills for the "Add website" form, read live from the
+    /// `default_*` settings keys (SEG-14 hot-apply).
+    pub default_min_interval_seconds: i64,
+    pub default_max_interval_seconds: i64,
+    pub default_min_session_seconds: i64,
+    pub default_max_session_seconds: i64,
 }
 
 #[derive(Template)]
@@ -336,20 +342,73 @@ pub struct SystemStatsFragment {
 // Settings
 // ---------------------------------------------------------------------------
 
+/// One rendered row of the settings page — shared by the full page render
+/// and the single-row / restore-all HTMX fragments.
 pub struct SettingRowView {
     pub key: String,
     pub value: String,
     pub default: String,
     pub bounds: String,
     pub help: String,
+    /// Editor kind: `number` | `text` | `bool` | `select` | `fixed`.
+    pub input_kind: &'static str,
+    /// `min`/`max` attribute strings for numeric inputs (`""` when N/A).
+    pub min_attr: String,
+    pub max_attr: String,
+    /// `value == default` — drives the small "default" badge.
+    pub default_badge: bool,
+    /// Subtle "restart required" chip (log_level, sqlite_maintenance_on_boot).
+    pub needs_restart: bool,
+    /// Read-only row (concurrent_visits — pinned to 1 by design).
+    pub read_only: bool,
+    /// Render `hx-swap-oob="outerHTML"` so the fragment replaces the row
+    /// during full restore responses instead of targeted swaps.
+    pub oob: bool,
+    pub csrf: String,
+    /// Options for the `select` editor (log_level). Empty for other kinds.
+    pub select_options: Vec<SelectOptionView>,
+    /// `inputmode` attribute for text-ish editors.
     pub inputmode: &'static str,
+}
+
+/// A `<select>` option with its `selected` flag precomputed, so the
+/// template never compares values.
+pub struct SelectOptionView {
+    pub value: &'static str,
+    pub selected: bool,
+}
+
+pub struct SettingGroupView {
+    pub title: &'static str,
+    pub blurb: &'static str,
+    /// Stable anchor id (`browser-memory`, ...) for deep links.
+    pub anchor: &'static str,
+    pub rows: Vec<SettingRowView>,
 }
 
 #[derive(Template)]
 #[template(path = "settings.html")]
 pub struct SettingsPage {
     pub chrome: LayoutChrome,
-    pub settings: Vec<SettingRowView>,
+    pub groups: Vec<SettingGroupView>,
+    pub total_keys: usize,
+    pub default_keys: usize,
+}
+
+/// Single-row fragment — rendered standalone on PATCH save/rejection and
+/// included by `settings.html` / `partials/settings_restore.html` during
+/// full-page and full-restore renders.
+#[derive(Template)]
+#[template(path = "partials/setting_row.html")]
+pub struct SettingRowFragment<'a> {
+    /// Askama variable name is the field name — the template uses `s.*`.
+    pub s: &'a SettingRowView,
+}
+
+#[derive(Template)]
+#[template(path = "partials/settings_restore.html")]
+pub struct SettingsRestoreFragment {
+    pub rows: Vec<SettingRowView>,
 }
 
 // ---------------------------------------------------------------------------

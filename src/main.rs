@@ -163,6 +163,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tracing::warn!("lightpanda unavailable; scheduler not started (no jobs will be emitted)");
     }
+    // SEG-14: history retention — enforced on boot and then once every
+    // 24h. `history_retention_days` is re-read live on each pass (never
+    // cached), so edits from the Settings page apply on the next pass.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            loop {
+                match config::typed_i64(&db, "history_retention_days").await {
+                    Ok(days) => match db.cleanup_expired_history(days).await {
+                        Ok(stats) => tracing::info!(
+                            retention_days = days,
+                            visit_history_deleted = stats.visit_history_deleted,
+                            browser_events_deleted = stats.browser_events_deleted,
+                            "retention pass complete"
+                        ),
+                        Err(e) => {
+                            tracing::error!(error = %e, "retention pass failed")
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(error = %e, "retention: unreadable history_retention_days")
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
+
     let app_state = state::SharedState::new(state::AppState::new(
         db.clone(),
         manager.clone(),
