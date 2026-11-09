@@ -1,6 +1,6 @@
 [package]
 name = "uptimepanda"
-version = "2026.11.9-alpha.3" # SemVer projection of CalVer 2026.11.09.1-alpha (Cargo requires SemVer; projection is monotonic with the CalVer ordering)
+version = "2026.11.9-alpha.4" # SemVer projection of CalVer 2026.11.09.1-alpha (Cargo requires SemVer; projection is monotonic with the CalVer ordering)
 edition = "2024"
 
 [dependencies]
