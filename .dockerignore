@@ -1,11 +1,35 @@
-.git
-target
-data
+# Keep the build context small and the image reproducible.
+# Patterns match repo-relative paths; negation re-includes the deployment contract.
+
+# VCS metadata and CI config are not needed inside the image
+.git/
+.github/
+
+# Rust build artifacts (the builder stage compiles from source)
+target/
+
+# Runtime data: SQLite databases, WAL/SHM journals, backups, dumps
+data/
+backups/
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.db-journal
+**/*.db-backup
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+
+# Secrets: real env files never enter the context; the template stays
+.env
+.env.*
+!.env.example
+
+# Tests and docs are not required to build or run the image
+tests/
+docs/
 *.md
-tests
 UPTIMEPANDA_PLAN.md
-*.db
-*.db-shm
-*.db-wal
-*.db-journal
-docs/phase0-validation.md
+
+# Smoke-test artifacts
+**/cookies.txt
