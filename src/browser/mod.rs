@@ -1,11 +1,10 @@
 //! Browser module: CDP client, process manager, sessions, cookies.
-//! SEG-05 lands the CDP client; SEG-06/SEG-07 build on it.
+//! SEG-05 landed the CDP client; SEG-06 adds the process manager.
 
-// Consumed by SEG-06 (process manager) and SEG-10 (executor); until those
-// wire it into the binary, the typed API is intentionally unused in this
-// crate. Remove the allow once a caller lands.
+pub mod cookies;
+// Typed CDP API consumed by SEG-10 (visit executor); the manager itself only
+// uses `cdp::connect` for its readiness verification.
 #[allow(dead_code)]
 pub mod cdp;
-pub mod cookies;
 pub mod manager;
 pub mod sessions;

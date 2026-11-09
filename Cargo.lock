@@ -1525,6 +1525,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "libc",
  "once_cell",
  "rand",
  "rusqlite",

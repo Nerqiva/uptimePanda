@@ -443,3 +443,39 @@ impl Db {
         Ok(rows)
     }
 }
+
+// ---------------------------------------------------------------------------
+// browser_events — coarse health/recycle milestones (SEG-06).
+// ---------------------------------------------------------------------------
+
+impl Db {
+    /// Insert a `browser_events` row. `memory_usage` is the browser resident
+    /// set size in bytes when relevant (e.g. `started`, `health_warn`).
+    ///
+    /// `event_type` is free text (no CHECK constraint in the schema); the
+    /// values used by the process manager are: `started`, `health_warn`,
+    /// `restarting`, `restarted`, `crashed`, `respawn_failed`, `crash_loop`,
+    /// `stopped`. `details` carries PIDs, ports and reasons — never secrets.
+    pub async fn insert_browser_event(
+        &self,
+        event_type: &str,
+        memory_usage: Option<i64>,
+        details: Option<&str>,
+    ) -> Result<i64> {
+        let event_type = event_type.to_owned();
+        let details = details.map(str::to_owned);
+        let timestamp = crate::db::models::format_db_ts(OffsetDateTime::now_utc())?;
+        let id = self
+            .connection()
+            .call(move |c| -> rusqlite::Result<i64> {
+                c.execute(
+                    "INSERT INTO browser_events (event_type, timestamp, memory_usage, details)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![event_type, timestamp, memory_usage, details],
+                )?;
+                Ok(c.last_insert_rowid())
+            })
+            .await?;
+        Ok(id)
+    }
+}

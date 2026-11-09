@@ -49,6 +49,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = db::Db::open(&config.database_path).await?;
     config::seed_settings(&db).await?;
 
+    // SEG-06: persistent Lightpanda process manager (recycle on >memory_restart_mb
+    // RSS or crash only). Deeper wiring (scheduler/executor, System page) lands
+    // in SEG-08/SEG-10/SEG-15/SEG-16 and is intentionally NOT done here.
+    // Dev ergonomics: if the binary is absent, log and continue serving /health.
+    // BROWSER_BINARY overrides the binary path; LIGHTPANDA_CDP_PORT overrides
+    // the base CDP port (default 9222, scanned upward on conflict).
+    let binary = std::env::var("BROWSER_BINARY").unwrap_or_else(|_| "lightpanda".to_string());
+    let base_port = std::env::var("LIGHTPANDA_CDP_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .unwrap_or(browser::manager::DEFAULT_BASE_PORT);
+    let manager = if std::process::Command::new(&binary)
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let manager =
+            browser::manager::BrowserManager::launch(db.clone(), &binary, base_port).await;
+        manager.spawn_monitoring();
+        // SEG-08/SEG-10 consume this via app state; SEG-21 wires shutdown().
+        // Kept alive here for the lifetime of the process.
+        Some(std::sync::Arc::new(manager))
+    } else {
+        tracing::warn!(
+            %binary,
+            "lightpanda not found (set BROWSER_BINARY to override); browser features disabled"
+        );
+        None
+    };
+    let _browser_manager = manager;
+
     let app = Router::new()
         .route("/health", get(health))
         .fallback(not_found);
